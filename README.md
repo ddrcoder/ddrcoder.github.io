@@ -1,2 +1,0 @@
-ddrcoder.github.io
-==================
