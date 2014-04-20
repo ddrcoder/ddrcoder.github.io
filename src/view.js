@@ -185,7 +185,6 @@ function Item(x) {
     sHist2.normalize();
     oHist2.normalize();
   };
-  self.compareEntropy(
 };
 function Model() {
   var self = this;
@@ -212,8 +211,8 @@ function newPair() {
   if (n > 1) {
     var gain = 0;
     var a, b;
-    for (int i = 0; i < n; ++i) {
-      for (int j = 0; j < n; ++j) {
+    for (var i = 0; i < n; ++i) {
+      for (var j = i + 1; j < n; ++j) {
         var newGain = m.items[i].hist.and(m.items[j].hist).entropy();
         if (newGain > gain) {
           a = i;
