@@ -12,7 +12,17 @@ function shuffle(a) {
 var ItemView = React.createClass({
   render: function() {
     if (this.props.item) {
-      return <span>{this.props.item.title}</span>;
+      var h = this.props.item.hist;
+      var l = h.p(0.1) / h.k;
+      var r = h.p(0.9) / h.k;
+      return (<table><tr><td>
+            {this.props.item.title}
+            </td><td>
+              <div style={{'margin-left': l * 100 + 'px',
+                            background: 'black',
+                            height: '20px',
+                            width: (r - l) * 100 + 'px'}}/>
+                            </td></tr></table>);
     } else {
       return <span/>;
     }
@@ -20,17 +30,16 @@ var ItemView = React.createClass({
 });
 var List = React.createClass({
   render: function() {
-    var keys = [];
     var items = this.props.items
-    for (var k in items) {
-      keys.push(k);
-    }
-    keys.sort(function(k1,k2) {
-      return items[k1].compareTo(items[k2]);
+    var keys = [];
+    for (var k in items) keys.push(k);
+    keys = keys.sort(function(a, b) {
+      return Item.compare(items[a], items[b]);
     });
     return <table className='items'>
-      {keys.map(function(k){
-          return <tr key={k}><td><ItemView item={items[k]}/></td></tr>;
+      {keys.map(function(k) {
+        console.debug(items[k].hist.h);
+        return <tr><td width='140px'><ItemView item={items[k]}/></td></tr>;
       })}
       </table>;
   }
@@ -63,7 +72,7 @@ var MutableList = React.createClass({
 var lastEvent = null;
 var Sorter = React.createClass({
   left: function(e){
-    this.props.learnOrder(this.props.left, this.props.right);
+    this.props.learnOrder(this.props.right, this.props.left);
     $('#left')[0].focus();
     return false;
   },
@@ -73,12 +82,11 @@ var Sorter = React.createClass({
     return false;
   },
   right: function(e){
-    this.props.learnOrder(this.props.right, this.props.left);
+    this.props.learnOrder(this.props.left, this.props.right);
     $('#right')[0].focus();
     return false;
   },
   key: function(e) {
-    console.debug('k');
     switch (e.keyCode) {
       case 37: return this.left(e);
       case 39: return this.right(e);
@@ -99,9 +107,9 @@ var Sorter = React.createClass({
           </td>
         </tr>
         <tr>
-          <td><input id='left' type="submit" value='<' onClick={this.left} onKeyDown={this.key}/> </td>
-          <td><input id='skip' type="submit" value='=' onClick={this.skip} onKeyDown={this.key}/> </td>
-          <td><input id='right' type="submit" value='>' onClick={this.right} onKeyDown={this.key}/></td>
+          <td><input id='left' type="submit" value='bigger' onClick={this.left} onKeyDown={this.key}/> </td>
+          <td><input id='skip' type="submit" value='skip' onClick={this.skip} onKeyDown={this.key}/> </td>
+          <td><input id='right' type="submit" value='bigger' onClick={this.right} onKeyDown={this.key}/></td>
         </tr>
       </table>
     </form>);
@@ -111,9 +119,6 @@ function Histogram(n) {
   var self = this;
   self.h = new Float32Array(n);
   self.k = n;
-  for (var i = 0; i < n; ++i) {
-    self.h[i] = 1.0 / n;
-  }
   self.normalize = function() {
     var s = 0;
     for (var i = 0; i < n; ++i) {
@@ -129,62 +134,121 @@ function Histogram(n) {
   self.entropy = function() {
     var e = 0;
     for (var i = 0; i < self.k; ++i) {
-      e += self.h[i] * Math.log(self.h[i]) / Math.log(2);
+      if (self.h[i])
+        e -= self.h[i] * Math.log(self.h[i]) / Math.log(2);
     }
     return e;
   };
-  self.and = function(o) {
-    var n = self.k;
-    var o = new Histogram(n);
-    for (var i = 0; i < self.k; ++i) {
-      o.h[i] = self.h[i] * o.h[i];
+  self.mean = function() {
+    var s = 0, d = 0;
+    for (var i = 1; i < self.k; ++i) {
+      s += i * self.h[i];
+      d += i;
     }
-    o.normalize();
-    return o;
-  };
-  self.order = function(next) {
-    var n = self.k;
-    var o1 = new Histogram(n);
-    var o2 = new Histogram(n);
-    for (var i = 0; i < n; ++i) {
-      for (var j = 0; j < n; ++i) {
-        if (i > j) {
-          var p = self.h[i] * other.h[j];
-          o1.h[i] += p;
-          o2.h[j] += p;
-        }
-      }
-    }
-    o1.normalize();
-    o2.normalize();
-    return [h1, h2];
+    return s / d;
   };
   self.p = function(t) {
     var i = 0;
     var s1 = 0, s2 = 0;
     for (; i < self.k; ++i) {
       s2 = s1 + self.h[i];
-      if (s2 > t) break;
+      if (s2 >= t) break;
+      s1 = s2;
     }
-    return i + (t - s1) / (s2 - s1);
+    if (s2 > s1) 
+      return i + (t - s1) / (s2 - s1);
+    else
+      return i;
   };
 }
+Histogram.even = function(n) {
+  var r = new Histogram(n);
+  for (var i = 0; i < n; ++i) {
+    r.h[i] = 1.0 / n;
+  }
+  return r;
+};
+Histogram.zero = function(n) {
+  return new Histogram(n);
+};
+Histogram.and = function(a, b) {
+  var s = 0;
+  for (var i = 0; i < a.k && i < b.k; ++i) {
+    s += Math.sqrt(a.h[i]) * Math.sqrt(b.h[i]);
+  }
+  return s;
+};
+Histogram.order = function(a, b) {
+  if (a.k != b.k)
+    return null;
+  var n = a.k;
+  var a2 = Histogram.zero(n);
+  var b2 = Histogram.zero(n);
+  var s = 0;
+  for (var i = 0; i < n; ++i) {
+    for (var j = 0; j < n; ++j) {
+      if (i < j) {
+        var p = a.h[i] * b.h[j];
+        a2.h[i] += p;
+        b2.h[j] += p;
+        s += p;
+      }
+    }
+  }
+  if (!s) {
+    return null;
+  }
+  a2.normalize();
+  b2.normalize();
+  return [a2, b2];
+};
 function Item(x) {
   var self = this;
   self.title = x;
-  self.compareTo = function(other) {
-    return self.value.sum / self.value.count < other.value.sum / other.value.count;
+  self.clear = function(n) {
+    self.hist = Histogram.even(n);
+    self.lessers = [];
+    self.greaters = [];
   };
-  self.exceed = function(other) {
-    var hs = self.hist.order(other.hist);
-    self.hist = hs[0];
-    other.hist = hs[1];
-    console.debug(hs[0]);
-    console.debug(hs[1]);
-    console.debug(hs[1]);
-    sHist2.normalize();
-    oHist2.normalize();
-  };
+  self.clear(0);
+};
+Item.compare = function(a, b) {
+  return a.hist.mean() - b.hist.mean();
+};
+Item.order = function(a, b) {
+  function orderOne(a, b) {
+    var hs = Histogram.order(a.hist, b.hist);
+    if (!hs)
+      return;
+    a.hist = hs[0];
+    b.hist = hs[1];
+  }
+  function applyUp(x) {
+    if (-1 != x.lessers.indexOf(a) ||
+        x == b)
+      return;
+    orderOne(a, x);
+    for (var i in x.greaters) {
+      applyUp(x.greaters[i]);
+    }
+    x.lessers.push(a);
+  }
+  function applyDown(x) {
+    if (-1 != x.greaters.indexOf(b) ||
+        x == a)
+      return;
+    orderOne(x, b);
+    for (var i in x.lessers) {
+      applyDown(x.lessers[i]);
+    }
+    x.greaters.push(b);
+  }
+  var a1 = a.hist, b1 = b.hist;
+  applyUp(b)
+  applyDown(a)
+  a.hist = a1;
+  b.hist = b1;
+  orderOne(a, b);
 };
 function Model() {
   var self = this;
@@ -192,16 +256,14 @@ function Model() {
   self.items = {};
   this.setup = function(x) {
     for (var k in self.items) {
-      self.items[k].hist = new Histogram(self.count);
+      self.items[k].clear(self.count);
     }
   };
   this.add = function(x) {
     var key = self.count;
     ++self.count;
     self.items[key] = new Item(x);
-  };
-  self.sort = function(){
-    self.items.sort(function(a,b) { return a.compareTo(b); });
+    self.setup();
   };
 }
 var m = new Model();
@@ -209,14 +271,27 @@ var sorter = null, view = null;
 function newPair() {
   var n = m.count;
   if (n > 1) {
-    var gain = 0;
+    var gain = -n;
     var a, b;
     for (var i = 0; i < n; ++i) {
       for (var j = i + 1; j < n; ++j) {
-        var newGain = m.items[i].hist.and(m.items[j].hist).entropy();
+        var ha = m.items[i].hist;
+        var hb = m.items[j].hist;
+        var ea1 = ha.entropy();
+        var eb1 = hb.entropy();
+        var case1 = Histogram.order(ha, hb);
+        var case2 = Histogram.order(hb, ha);
+        if (!case1) { case1 = case2; }
+        if (!case2) { case2 = case1; }
+        var ea2 = Math.max(case1[0].entropy(), case2[1].entropy());
+        var eb2 = Math.max(case1[1].entropy(), case2[0].entropy());
+        
+        var newGain = ea1 + eb1 - ea2 - eb2;
+
         if (newGain > gain) {
           a = i;
           b = j;
+          gain = newGain;
         }
       }
     }
@@ -230,11 +305,11 @@ function addItem(x) {
   newPair();
 }
 function learnOrder(a, b) {
-  newPair();
   if (a || b) {
-    a.precede(b);
+    Item.order(a, b);
     view.forceUpdate();
   }
+  newPair();
 }
 view = React.renderComponent(<MutableList items={m.items} add={addItem} sorter={m.sort}/>, $('#list')[0]);
 sorter = React.renderComponent(<Sorter learnOrder={learnOrder}/>, $('#sorter')[0]);
