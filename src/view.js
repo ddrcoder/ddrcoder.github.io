@@ -172,11 +172,11 @@ Histogram.zero = function(n) {
   return new Histogram(n);
 };
 Histogram.and = function(a, b) {
-  var s = 0;
+  var r = Histogram.zero(a.k);
   for (var i = 0; i < a.k && i < b.k; ++i) {
-    s += Math.sqrt(a.h[i]) * Math.sqrt(b.h[i]);
+    r.h[i] = Math.sqrt(a.h[i]) * Math.sqrt(b.h[i]);
   }
-  return s;
+  return r;
 };
 Histogram.order = function(a, b) {
   if (a.k != b.k)
@@ -275,19 +275,13 @@ function newPair() {
     var a, b;
     for (var i = 0; i < n; ++i) {
       for (var j = i + 1; j < n; ++j) {
+        if (m.items[i].greaters.indexOf(m.items[j]) != -1 ||
+            m.items[j].greaters.indexOf(m.items[i]) != -1)
+          continue;
+        var hb = m.items[j].hist;
         var ha = m.items[i].hist;
         var hb = m.items[j].hist;
-        var ea1 = ha.entropy();
-        var eb1 = hb.entropy();
-        var case1 = Histogram.order(ha, hb);
-        var case2 = Histogram.order(hb, ha);
-        if (!case1) { case1 = case2; }
-        if (!case2) { case2 = case1; }
-        var ea2 = Math.max(case1[0].entropy(), case2[1].entropy());
-        var eb2 = Math.max(case1[1].entropy(), case2[0].entropy());
-        
-        var newGain = ea1 + eb1 - ea2 - eb2;
-
+        var newGain = Histogram.and(ha, hb).entropy();
         if (newGain > gain) {
           a = i;
           b = j;
@@ -295,8 +289,13 @@ function newPair() {
         }
       }
     }
-    sorter.props.left = m.items[a];
-    sorter.props.right = m.items[b];
+    if (a || b) {
+      sorter.props.left = m.items[a];
+      sorter.props.right = m.items[b];
+    } else {
+      sorter.props.left = null;
+      sorter.props.right = null;
+    }
     sorter.forceUpdate();
   }
 }
