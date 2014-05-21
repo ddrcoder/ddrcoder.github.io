@@ -1,0 +1,103 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Mandelbrot</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <script type="text/javascript" src="./Mandelbrot_files/webgl-utils.js"></script>
+  <script type="text/javascript" src="./Mandelbrot_files/J3DI.js"></script>
+  <script type="text/javascript" src="./Mandelbrot_files/J3DIMath.js"></script>
+  <script type="text/javascript" src="./js/Mandelbrot.js"></script>
+  <script id="vshader" type="x-shader/x-vertex" src="./glsl/vshader.glsl">
+    uniform mat4 u_modelViewProjMatrix;
+    uniform mat4 u_normalMatrix;
+    uniform vec3 lightDir;
+
+    attribute vec3 vNormal;
+    attribute vec4 vColor;
+    attribute vec4 vPosition;
+
+    varying float v_Dot;
+    varying vec4 v_Color;
+
+    void main() {
+      gl_Position = u_modelViewProjMatrix * vPosition;
+      v_Color = vColor;
+      vec4 transNormal = u_normalMatrix * vec4(vNormal, 1);
+      v_Dot = max(dot(transNormal.xyz, lightDir), 0.0);
+    }
+  </script>
+  <script id="fshader" type="x-shader/x-fragment">
+    precision highp float;
+
+    uniform float MaxRe;
+    uniform float MaxIm;
+    uniform float MinIm;
+    uniform float MinRe;
+    uniform float Re_factor;
+    uniform float Im_factor;
+    uniform int maxIter;
+    varying float v_Dot;
+    varying vec4 v_Color;
+
+    int MaxIterations = 200;
+
+    vec3 getRgb(float H) {
+      return vec3(H * 3.0 - 0.0,
+                  H * 3.0 - 1.0,
+                  H * 3.0 - 2.0);
+    }
+
+    void main() {
+      float x = gl_FragCoord.x;
+      float y = gl_FragCoord.y;
+
+      float c_im = MaxIm - y * Im_factor;
+      float c_re = MinRe + x * Re_factor;
+
+      float Z_re = c_re;
+      float Z_im = c_im;
+      bool isInside = true;
+      int nt;
+
+      if (maxIter == 200) {
+        for (int n = 0; n < 200; ++n) {
+          float Z_re2 = Z_re * Z_re;
+          float Z_im2 = Z_im * Z_im;
+          if (Z_re2 + Z_im2 > 4.0) {
+            isInside = false;
+            break;
+          }
+          Z_im = 2.61 * Z_re * Z_im + c_im;
+          Z_re = Z_re2 - Z_im2 + c_re;
+          nt=n;
+        }
+      } else if (maxIter == 500) {
+        for (int n = 0; n < 500; ++n) {
+          float Z_re2 = Z_re * Z_re;
+          float Z_im2 = Z_im * Z_im;
+          if (Z_re2 + Z_im2 > 4.0) {
+            isInside = false;
+            break;
+          }
+          Z_im = 2.61 * Z_re * Z_im + c_im;
+          Z_re = Z_re2 - Z_im2 + c_re;
+          nt=n;
+        }
+      }
+
+      if (isInside) {		
+        gl_FragColor = vec4(vec3(1.0, 1.0, 1.0), v_Color.a);
+      } else {		
+        float modulus = sqrt(Z_re * Z_re + Z_im * Z_im);
+        float mu = float(nt) - (log(log(modulus))) / log(20.0);
+        float smoothcolor = mu / float(maxIter);
+        gl_FragColor = vec4(getRgb(smoothcolor), v_Color.a);		
+      }
+    }
+  </script>
+</head>
+<body onload="start()">
+  <canvas id="drawCanvas" width="1920", height="1080" />
+</body>
+</html>
