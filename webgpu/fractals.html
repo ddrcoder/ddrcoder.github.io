@@ -26,25 +26,33 @@
 </head>
 
 <body>
-    <div id="toolbar" style="display: flex; align-items: center; color: white; font-family: Helvetica, Arial, sans-serif;">
+    <div id="toolbar"
+        style="display: flex; align-items: center; color: white; font-family: Helvetica, Arial, sans-serif; gap: 10px;">
+        <select id="color-scheme-select" onchange="updateColorScheme(this.value)">
+            <option value="0">Ice</option>
+            <option value="1">Fire</option>
+        </select>
         <div style="flex-grow: 1; display: flex; align-items: center;">
             <label for="t-slider">t:</label>
-            <input type="range" id="t-slider" min="-1" max="1" step="0.01" value="0" oninput="updateT(this.value)" style="flex-grow: 1; margin: 0 10px;">
+            <input type="range" id="t-slider" min="-1" max="1" step="0.0001" value="0" oninput="updateT(this.value)"
+                style="flex-grow: 1; margin: 0 10px;">
             <span id="t-value">0</span>
         </div>
-        <div style="width: 100px; display: flex; align-items: center; margin-left: 10px;">
+        <div style=" display: flex; align-items: center; margin: 10px;">
             <label for="aa-slider">AA:</label>
-            <input type="range" id="aa-slider" min="0" max="8" step="1" value="2" oninput="updateAA(this.value)" style="flex-grow: 1; margin: 0 5px;">
+            <input type="range" id="aa-slider" min="0" max="8" step="1" value="2" oninput="updateAA(this.value)"
+                style="flex-grow: 1; margin: 5px;">
             <span id="aa-value">2</span>
         </div>
-        <div style="width: 200px; display: flex; align-items: center; margin-left: 60px;">
-            <label for="max-iterations-slider" style="white-space: nowrap;">Max Iterations:</label>
-            <input type="range" id="max-iterations-slider" min="50" max="1000" step="50" value="512" oninput="updateMaxIterations(this.value)" style="flex-grow: 1; margin: 0 5px;">
-            <span id="max-iterations-value">512</span>
+        <div style=" display: flex; align-items: center; margin: 10px;">
+            <label for="max-iterations-slider" style="white-space: nowrap; margin-right: 10px;">Max Iterations:</label>
+            <input type="range" id="max-iterations-slider" min="4" max="2048" step="8" value="256"
+                oninput="updateMaxIterations(this.value)" style="flex-grow: 1; margin: 0 5px;">
+            <span id="max-iterations-value">2048</span>
         </div>
-        <div style="display: flex; align-items: center; margin-left: 10px;">
+        <div style="display: flex; align-items: center; margin: 10px;">
             <input type="number" id="export-width" value="1920" min="1" step="1" style="width: 60px;">
-            <span style="margin: 0 5px;">x</span>
+            <span style="margin: 5px 5px;">x</span>
             <input type="number" id="export-height" value="1080" min="1" step="1" style="width: 60px;">
             <button id="export-button" onclick="tileExport()" style="margin-left: 10px;">Export PNG</button>
         </div>
@@ -59,6 +67,14 @@
         }
 
         const TILE_SIZE = 1024; // Configurable tile size for export
+        const IDLE_INTERVAL = 250;
+        const ColorScheme = {
+            ICE: 0,
+            FIRE: 1
+        };
+
+        // Default color scheme
+        let currentColorScheme = ColorScheme.ICE;
 
         function resizeCanvas() {
             canvas.width = window.innerWidth;
@@ -87,7 +103,16 @@
             uniform float u_t;
             uniform int u_aa_root;
             uniform int u_max_iter;
+            uniform int u_color_scheme;
 
+            vec2 iteration(vec2 z, vec2 c) {
+                // return vec2(z.x * z.x - z.y * z.y + c.x, (2. + u_t) * z.x * z.y + c.y);
+                // z^2 + c with t
+                 z = vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
+                z += c;
+                return z;
+
+            }  
 
             void main() {
                 vec3 color = vec3(0.0);
@@ -105,12 +130,9 @@
 
                     vec2 z = vec2(0.0, 0.0);
                     float mu = float(u_max_iter);
-                    for (int i = 0; i < 1024; i++) {
+                    for (int i = 0; i < 2048; i++) {
                         if (i >= u_max_iter) break;
-                        z = vec2(
-                            z.x * z.x - z.y * z.y + c.x,
-                            (2. + u_t) * z.x * z.y + c.y
-                        );
+                        z = iteration(z, c);
                         if (dot(z, z) > 4.0) {
                             mu = float(i);
                             break;
@@ -122,11 +144,21 @@
                     }
                     float t = mu / float(u_max_iter);
 
-                    color += vec3(
-                        clamp(t * 3. - 2., 0.0, 1.0),
-                        clamp(t * 3. - 1., 0.0, 1.0),
-                        clamp(t * 3. - 0., 0.0, 1.0)
-                    );
+                    vec3 tap = vec3(0.0);
+                    if (u_color_scheme == 1) {
+                        tap = vec3(
+                            clamp(t * 3. - 0., 0.0, 1.0),
+                            clamp(t * 3. - 1., 0.0, 1.0),
+                            clamp(t * 3. - 2., 0.0, 1.0)
+                        );
+                    } else if (u_color_scheme == 0) {
+                        tap = vec3(
+                            clamp(t * 3. - 2., 0.0, 1.0),
+                            clamp(t * 3. - 1., 0.0, 1.0),
+                            clamp(t * 3. - 0., 0.0, 1.0)
+                        );
+                    }
+                    color += tap;
                 }
 
                 color /= float(aa_max);
@@ -231,12 +263,13 @@
                     zoom: gl.getUniformLocation(program, 'u_zoom'),
                     t: gl.getUniformLocation(program, 'u_t'),
                     aaRoot: gl.getUniformLocation(program, 'u_aa_root'),
-                    maxIter: gl.getUniformLocation(program, 'u_max_iter')
+                    maxIter: gl.getUniformLocation(program, 'u_max_iter'),
+                    colorScheme: gl.getUniformLocation(program, 'u_color_scheme')
                 }
             };
         }
 
-        function renderFractal(gl, uniforms, state, width, height) {
+        function renderFractal(gl, uniforms, state, interactive, width, height) {
             gl.viewport(0, 0, width, height);
             gl.clearColor(0, 0, 0, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
@@ -245,8 +278,9 @@
             gl.uniform2f(uniforms.pan, state.panX, state.panY);
             gl.uniform1f(uniforms.zoom, state.zoom);
             gl.uniform1f(uniforms.t, state.t);
-            gl.uniform1i(uniforms.aaRoot, state.aaRoot);
+            gl.uniform1i(uniforms.aaRoot, interactive ? 0 : state.aaRoot);
             gl.uniform1i(uniforms.maxIter, state.maxIterations);
+            gl.uniform1i(uniforms.colorScheme, currentColorScheme);
 
             gl.drawArrays(gl.TRIANGLES, 0, 6);
         }
@@ -254,9 +288,25 @@
         // Initialize main canvas
         const { program: mainProgram, uniforms } = initWebGL(gl);
 
+        var pauseAa = false;
+        var idleIntervalId = 0;
+        function queueIdleDraw() {
+            if (idleIntervalId > 0) {
+                console.log("cancelling idle draw");
+                clearInterval(idleIntervalId);
+            }
+            idleIntervalId = setInterval(()=>{
+                console.log("idle draw");
+                renderFractal(gl, uniforms, state, false, canvas.width, canvas.height);
+                clearInterval(idleIntervalId);
+                idleIntervalId = 0;
+            }, IDLE_INTERVAL);
+            console.log("queued idle draw");
+        }
         function drawScene() {
-            renderFractal(gl, uniforms, state, canvas.width, canvas.height);
+            renderFractal(gl, uniforms, state, true, canvas.width, canvas.height);
             updateURLFragment();
+            queueIdleDraw();
         }
 
         // Call this function to initialize state from URL
@@ -386,6 +436,11 @@
             }
         });
 
+        function updateColorScheme(scheme) {
+            currentColorScheme = scheme;
+            drawScene();
+        }
+
         function updateT(value) {
             state.t = parseFloat(value);
             document.getElementById('t-value').textContent = state.t.toFixed(2);
@@ -444,7 +499,7 @@
                         panY: centerY,
                         zoom: exportZoom,
                         aaRoot: 8,
-                    }, TILE_SIZE, TILE_SIZE);
+                    }, false, TILE_SIZE, TILE_SIZE);
 
                     // Copy the tile to the main canvas
                     exportCtx.drawImage(tileCanvas, tileX * TILE_SIZE, tileY * TILE_SIZE);
@@ -457,7 +512,7 @@
 
             // Create download link
             const link = document.createElement('a');
-            link.download = 'fractal.png';
+            link.download = `fractal_${width}x${height}.png`;
             link.href = exportCanvas.toDataURL('image/png');
             link.click();
         }
