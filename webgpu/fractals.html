@@ -46,9 +46,9 @@
         </div>
         <div style=" display: flex; align-items: center; margin: 10px;">
             <label for="max-iterations-slider" style="white-space: nowrap; margin-right: 10px;">Max Iterations:</label>
-            <input type="range" id="max-iterations-slider" min="4" max="2048" step="8" value="256"
-                oninput="updateMaxIterations(this.value)" style="flex-grow: 1; margin: 0 5px;">
-            <span id="max-iterations-value">2048</span>
+            <input type="range" id="max-iterations-slider" min="0" max="120" step="1" value="80"
+                oninput="updateMaxIterations(Math.pow(2, 0.1 * this.value))" style="flex-grow: 1; margin: 0 5px;">
+            <span id="max-iterations-value">256</span>
         </div>
         <div style="display: flex; align-items: center; margin: 10px;">
             <input type="number" id="export-width" value="1920" min="1" step="1" style="width: 60px;">
@@ -73,7 +73,6 @@
             FIRE: 1
         };
 
-        // Default color scheme
         let currentColorScheme = ColorScheme.ICE;
 
         function resizeCanvas() {
@@ -108,11 +107,74 @@
             vec2 iteration(vec2 z, vec2 c) {
                 // return vec2(z.x * z.x - z.y * z.y + c.x, (2. + u_t) * z.x * z.y + c.y);
                 // z^2 + c with t
-                 z = vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
+                z = vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
                 z += c;
                 return z;
+            } 
+            
+            #define F64 vec2
+            #define C64 vec4
 
-            }  
+            const float M = pow(2., -20.);
+            F64 f64(F64 x) {
+                float lower = mod(x.y, M);
+                return vec2(x.y - lower + x.x, lower);
+            }
+
+            F64 f64(float major, float mid, float minor) {
+                float lower = mod(mid, M);
+                return vec2(mid - lower + major, lower + minor);
+            }
+            
+            F64 f64mul(F64 a, F64 b) {
+                return f64(a.x * b.x, a.x * b.y + a.y * b.x, a.y * b.y);
+            }   
+            C64 c64mul(C64 a, C64 b) {
+                return C64(
+                    f64mul(a.xy, b.xy) - f64mul(a.zw, b.zw),
+                    f64mul(a.xy, b.zw) + f64mul(a.zw, b.xy)
+                );
+            }   
+
+            F64 f64add(F64 a, F64 b) {
+                return f64(a + b);
+            }   
+            
+            float f64mag2(F64 x) {
+                return x.x * x.x +  x.y * x.y;
+            }
+            
+            float c64mag2(C64 c) {
+                return f64mag2(f64mul(c.xy, c.xy) + f64mul(c.zw, c.zw));
+            }
+
+            float iterate(C64 z, C64 c) {
+                for (int i = 0; i < 2048; i++) {
+                    if (i >= u_max_iter) break;
+                    z = c + C64(f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw), 2. * f64mul(z.xy, z.zw));
+                    // z = z^2 + c
+                    float mag2 = c64mag2(z);
+                    if (mag2 > 64.0) {
+                        return (float(i) - log2(log2(mag2)) + 4.0) / float(u_max_iter);
+                    }
+                }
+                return 1.0;
+            }
+
+            float iterate(vec2 z, vec2 c) {
+                for (int i = 0; i < 2048; i++) {
+                    if (i >= u_max_iter) break;
+                    z = iteration(z, c);
+                    if (dot(z, z) > 64.0) {
+                        return (float(i) - log2(log2(dot(z, z))) + 4.0) / float(u_max_iter);
+                    }
+                }
+                return 1.0;
+            }
+
+            C64 makeC64(vec2 hi, vec2 lo) {
+                return C64(hi.x, lo.x, hi.y, lo.y);
+            }
 
             void main() {
                 vec3 color = vec3(0.0);
@@ -126,24 +188,12 @@
                         float(aa) * aa_dx - float(int(float(aa) * aa_dx)),
                         float(aa) * aa_dy
                     );
-                    vec2 c = ((gl_FragCoord.xy + offset) - u_resolution * 0.5) / (u_zoom * u_resolution.y) + u_pan;
-
-                    vec2 z = vec2(0.0, 0.0);
-                    float mu = float(u_max_iter);
-                    for (int i = 0; i < 2048; i++) {
-                        if (i >= u_max_iter) break;
-                        z = iteration(z, c);
-                        if (dot(z, z) > 4.0) {
-                            mu = float(i);
-                            break;
-                        }
-                    }
-
-                    if (mu < float(u_max_iter)) {
-                        mu -= log2(log2(dot(z, z))) + 4.0;
-                    }
-                    float t = mu / float(u_max_iter);
-
+                    vec4 c = makeC64(
+                        u_pan,
+                        (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
+                    );
+                    vec4 z = vec4(0.0, 0.0, 0.0, 0.0);
+                    float t = iterate(z, c);
                     vec3 tap = vec3(0.0);
                     if (u_color_scheme == 1) {
                         tap = vec3(
@@ -198,7 +248,6 @@
         const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
         const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
 
-        // Define the state object
         const state = {
             panX: 0,
             panY: 0,
@@ -232,15 +281,15 @@
             state.zoom = parseFloat(params.get('zoom')) || state.zoom;
             state.t = parseFloat(params.get('t')) || state.t;
             state.aaRoot = parseInt(params.get('aa')) || state.aaRoot;
-            state.maxIterations = parseInt(params.get('iter')) || state.maxIterations;
+            state.maxIterations = Math.max(4, parseInt(params.get('iter')) || state.maxIterations);
 
-            // Update UI elements
-            document.getElementById('t-slider').value = state.t;
-            document.getElementById('t-value').textContent = state.t.toFixed(2);
-            document.getElementById('aa-slider').value = state.aaRoot;
-            document.getElementById('aa-value').textContent = state.aaRoot;
-            document.getElementById('max-iterations-slider').value = state.maxIterations;
-            document.getElementById('max-iterations-value').textContent = state.maxIterations;
+            const elem = (id => document.getElementById(id));
+            elem('t-slider').value = state.t;
+            elem('t-value').textContent = state.t.toFixed(2);
+            elem('aa-slider').value = state.aaRoot;
+            elem('aa-value').textContent = state.aaRoot;
+            elem('max-iterations-slider').value = Math.log2(state.maxIterations) * 10;
+            elem('max-iterations-value').textContent = state.maxIterations;
         }
 
         function initWebGL(gl) {
@@ -501,29 +550,24 @@
                         aaRoot: 8,
                     }, false, TILE_SIZE, TILE_SIZE);
 
-                    // Copy the tile to the main canvas
                     exportCtx.drawImage(tileCanvas, tileX * TILE_SIZE, tileY * TILE_SIZE);
 
-                    // Update progress
                     tilesDone++;
                     console.log(`Rendered tile ${tilesDone}/${totalTiles}`);
                 }
             }
 
-            // Create download link
             const link = document.createElement('a');
             link.download = `fractal_${width}x${height}.png`;
             link.href = exportCanvas.toDataURL('image/png');
             link.click();
         }
 
-        // Replace the old exportImage function with this new one
         function exportImage() {
             console.log('Exporting image...');
             tileExport();
         }
 
-        // Move this to the end of your script
         document.addEventListener('DOMContentLoaded', () => {
             resizeCanvas();
             drawScene();
