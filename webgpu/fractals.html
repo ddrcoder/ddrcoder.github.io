@@ -56,6 +56,10 @@
             <input type="number" id="export-height" value="1080" min="1" step="1" style="width: 60px;">
             <button id="export-button" onclick="tileExport()" style="margin-left: 10px;">Export PNG</button>
         </div>
+        <div style="display: flex; align-items: center; margin: 10px;">
+            <label for="high-precision-checkbox">High Precision</label>
+            <input type="checkbox" id="high-precision-checkbox" onchange="updateHighPrecision(this.checked)">
+        </div>
     </div>
     <canvas id="glcanvas"></canvas>
     <script>
@@ -81,6 +85,11 @@
             gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
         }
 
+        function updateHighPrecision(checked) {
+            state.highPrecision = checked;
+            drawScene();
+        }
+
         window.addEventListener('resize', () => {
             resizeCanvas();
             drawScene();
@@ -97,12 +106,13 @@
             precision highp float;
 
             uniform vec2 u_resolution;
-            uniform vec2 u_pan;
+            uniform vec4 u_pan;
             uniform float u_zoom;
             uniform float u_t;
             uniform int u_aa_root;
             uniform int u_max_iter;
             uniform int u_color_scheme;
+            uniform bool u_high_precision;
 
             vec2 iteration(vec2 z, vec2 c) {
                 // return vec2(z.x * z.x - z.y * z.y + c.x, (2. + u_t) * z.x * z.y + c.y);
@@ -116,13 +126,18 @@
             #define C64 vec4
 
             const float M = pow(2., -20.);
+            float ff(float f) {
+                return mod(f, M);
+            }
+
             F64 f64(F64 x) {
-                float lower = mod(x.y, M);
+                float lower = ff(x.y);
                 return vec2(x.y - lower + x.x, lower);
             }
 
             F64 f64(float major, float mid, float minor) {
-                float lower = mod(mid, M);
+                float lower = ff(mid);
+                // return vec2(mid + major - lower, lower + minor);
                 return vec2(mid - lower + major, lower + minor);
             }
             
@@ -151,7 +166,7 @@
             float iterate(C64 z, C64 c) {
                 for (int i = 0; i < 2048; i++) {
                     if (i >= u_max_iter) break;
-                    z = c + C64(f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw), 2. * f64mul(z.xy, z.zw));
+                    z = c + C64(f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw), (2. + u_t) * f64mul(z.xy, z.zw));
                     // z = z^2 + c
                     float mag2 = c64mag2(z);
                     if (mag2 > 64.0) {
@@ -173,7 +188,9 @@
             }
 
             C64 makeC64(vec2 hi, vec2 lo) {
-                return C64(hi.x, lo.x, hi.y, lo.y);
+                vec4 p;
+                p.xzyw = vec4(hi, lo);
+                return C64(f64(p.xy), f64(p.zw));
             }
 
             void main() {
@@ -185,15 +202,15 @@
                 for (int aa = 0; aa < 64; aa++) {
                     if (aa >= aa_max) break;
                     vec2 offset = vec2(
-                        float(aa) * aa_dx - float(int(float(aa) * aa_dx)),
+                        fract(float(aa) * aa_dx),
                         float(aa) * aa_dy
                     );
                     vec4 c = makeC64(
-                        u_pan,
-                        (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
+                        u_pan.xz,
+                        u_pan.yw + (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
                     );
                     vec4 z = vec4(0.0, 0.0, 0.0, 0.0);
-                    float t = iterate(z, c);
+                    float t = u_high_precision ? iterate(z, c) : iterate(z.xy, vec2(c.x + c.y, c.z+c.w));
                     vec3 tap = vec3(0.0);
                     if (u_color_scheme == 1) {
                         tap = vec3(
@@ -257,7 +274,8 @@
             maxIterations: 512,
             isDragging: false,
             lastX: 0,
-            lastY: 0
+            lastY: 0,
+            highPrecision: false
         };
 
         const positions = [
@@ -282,6 +300,7 @@
             state.t = parseFloat(params.get('t')) || state.t;
             state.aaRoot = parseInt(params.get('aa')) || state.aaRoot;
             state.maxIterations = Math.max(4, parseInt(params.get('iter')) || state.maxIterations);
+            state.highPrecision = params.get('high_precision') === 'true';
 
             const elem = (id => document.getElementById(id));
             elem('t-slider').value = state.t;
@@ -293,7 +312,9 @@
         }
 
         function initWebGL(gl) {
-            const program = createProgram(gl, createShader(gl, gl.VERTEX_SHADER, vertexShaderSource), createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource));
+            const program = createProgram(gl,
+                createShader(gl, gl.VERTEX_SHADER, vertexShaderSource),
+                createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource));
             gl.useProgram(program);
 
             const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
@@ -313,7 +334,8 @@
                     t: gl.getUniformLocation(program, 'u_t'),
                     aaRoot: gl.getUniformLocation(program, 'u_aa_root'),
                     maxIter: gl.getUniformLocation(program, 'u_max_iter'),
-                    colorScheme: gl.getUniformLocation(program, 'u_color_scheme')
+                    colorScheme: gl.getUniformLocation(program, 'u_color_scheme'),
+                    highPrecision: gl.getUniformLocation(program, 'u_high_precision')
                 }
             };
         }
@@ -323,13 +345,22 @@
             gl.clearColor(0, 0, 0, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
+            const panX = state.panX;
+            const panXhi = state.panX - (state.panX - Number(Math.floor(state.panX * 65536.0)) / 65536.0);  
+            const panXlo = (state.panX - panXhi);
+            const panY = state.panY;
+            const panYhi = state.panY - (state.panY - Number(Math.floor(state.panY * 65536.0)) / 65536.0);
+            const panYlo = (state.panY - panYhi);
+
             gl.uniform2f(uniforms.resolution, width, height);
-            gl.uniform2f(uniforms.pan, state.panX, state.panY);
+            gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
+            //gl.uniform4f(uniforms.pan, state.panX, 0., state.panY, 0.);
             gl.uniform1f(uniforms.zoom, state.zoom);
             gl.uniform1f(uniforms.t, state.t);
             gl.uniform1i(uniforms.aaRoot, interactive ? 0 : state.aaRoot);
             gl.uniform1i(uniforms.maxIter, state.maxIterations);
             gl.uniform1i(uniforms.colorScheme, currentColorScheme);
+            gl.uniform1i(uniforms.highPrecision, state.highPrecision ? 1 : 0);
 
             gl.drawArrays(gl.TRIANGLES, 0, 6);
         }
