@@ -102,8 +102,14 @@
             }
         `;
 
+        const F = 4097.0;
+        const RF = 1.0 / F;
+
         const fragmentShaderSource = `
             precision highp float;
+
+            const float F = 4097.0;
+            const float RF = 1.0 / F;
 
             uniform vec2 u_resolution;
             uniform vec4 u_pan;
@@ -125,23 +131,55 @@
             #define F64 vec2
             #define C64 vec4
 
-            F64 f64mul(F64 a, F64 b) {
-                return F64(a.x * b.x, a.y * b.y + a.x * b.y + a.y * b.x);
+            F64 f64add(F64 a, F64 b) {
+                return a+b;
+                float xh = a.x;
+                float xl = a.y;
+                float yh = b.x;
+                float yl = b.y;
+
+                float sh = xh + yh; float _1 = sh - xh; float sl = (xh - (sh - _1)) + (yh - _1);
+                float th = xl + yl; float _2 = th - xl; float tl = (xl - (th - _2)) + (yl - _2);
+                float c = sl + th;
+                float vh = sh + c; float vl = c - (vh - sh);
+                float w = tl + vl;
+                float zh = vh + w; float zl = w - (zh - vh); 
+
+                return F64(zh, zl);
+            }
+
+            F64 f64mul(F64 x, F64 y) {
+                return F64((x.x + x.y) * (y.x + y.y), 0.);
+                float xh = x.x;
+                float yh = y.x;
+
+                float ch = xh * yh;
+                float c = F * xh; float ah = c - (c - xh); float al = xh - ah;
+                float d = F * yh; float bh = d - (d - yh); float bl = yh - bh;
+                float cl1 = (al*bl) - ((ch - (ah*bh)) - (al*bh) - (ah*bl));
+
+                float b = cl1 + (xh*y.y + x.y*yh);  
+                float xx = ch + b;
+                return F64(b - (xx - ch), xx);
             }   
+
+            C64 c64add(C64 a, C64 b) {
+                return C64(
+                    f64add(a.xy, b.xy),
+                    f64add(a.zw, b.zw)
+                );
+            }
 
             C64 c64mul(C64 a, C64 b) {
                 return C64(
-                    f64mul(a.xy, b.xy) - f64mul(a.zw, b.zw),
-                    f64mul(a.xy, b.zw) + f64mul(a.zw, b.xy)
+                    f64add(f64mul(a.xy, b.xy), -f64mul(a.zw, b.zw)),
+                    f64add(f64mul(a.xy, b.zw), f64mul(a.zw, b.xy))
                 );
-            }   
-
-            F64 f64add(F64 a, F64 b) {
-                return a + b;
             }   
             
             float f64mag2(F64 f) {
-                return f.x * f.x + f.y * f.y + 2.0 * f.x * f.y;
+                f.x += f.y;
+                return f.y * f.y;
             }
             
             float c64mag2(C64 c) {
@@ -151,14 +189,14 @@
             float iterate(C64 z, C64 c) {
                 for (int i = 0; i < 2048; i++) {
                     if (i >= u_max_iter) break;
-                    z = c + C64(f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw), (2. + u_t) * f64mul(z.xy, z.zw));
+                    z = c64add(c64mul(z, z), c);
                     float mag2 = c64mag2(z);
                     if (mag2 > 64.0) {
                         return float(i) / float(u_max_iter);
                     }
-                    if (z.w * z.w > 100000000.0) {
+                    /*if (z.w * z.w > 100000000.0) {
                         return -1.0;
-                    }
+                    }*/
                 }
                 return 1.0;
             }
@@ -175,9 +213,7 @@
             }
 
             C64 makeC64(vec2 hi, vec2 lo) {
-                vec4 p;
-                p.xzyw = vec4(hi, lo);
-                return p.xyzw;
+                return vec4(hi, lo).xzyw;
             }
 
             void main() {
@@ -337,17 +373,15 @@
             gl.clearColor(0, 0, 0, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
-            /*
             const panX = state.panX;
-            const panXhi = state.panX - (state.panX - Number(0|(state.panX * 65536.0)) / 65536.0);  
-            const panXlo = (state.panX - panXhi);
+            const panXhi = ((state.panX * F) | 0) * RF;
+            const panXlo = state.panX - panXhi;
             const panY = state.panY;
-            const panYhi = state.panY - (state.panY - Number(0|(state.panY * 65536.0)) / 65536.0);
-            const panYlo = (state.panY - panYhi);
-            */
+            const panYhi = ((state.panY * F) | 0) * RF;
+            const panYlo = state.panY - panYhi;
 
             gl.uniform2f(uniforms.resolution, width, height);
-            //gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
+            // gl.uniform4f(uniforms.pan, panXhi, panYhi, panXlo, panYlo);
             gl.uniform4f(uniforms.pan, state.panX, state.panY, 0., 0.);
             gl.uniform1f(uniforms.zoom, state.zoom);
             gl.uniform1f(uniforms.t, state.t);
