@@ -113,10 +113,10 @@
             uniform int u_max_iter;
             uniform int u_color_scheme;
             uniform bool u_high_precision;
+            uniform float u_one;
+            uniform float u_uno;
 
             vec2 iteration(vec2 z, vec2 c) {
-                // return vec2(z.x * z.x - z.y * z.y + c.x, (2. + u_t) * z.x * z.y + c.y);
-                // z^2 + c with t
                 z = vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
                 z += c;
                 return z;
@@ -125,25 +125,10 @@
             #define F64 vec2
             #define C64 vec4
 
-            const float M = pow(2., -20.);
-            float ff(float f) {
-                return mod(f, M);
-            }
-
-            F64 f64(F64 x) {
-                float lower = ff(x.y);
-                return vec2(x.y - lower + x.x, lower);
-            }
-
-            F64 f64(float major, float mid, float minor) {
-                float lower = ff(mid);
-                // return vec2(mid + major - lower, lower + minor);
-                return vec2(mid - lower + major, lower + minor);
-            }
-            
             F64 f64mul(F64 a, F64 b) {
-                return f64(a.x * b.x, a.x * b.y + a.y * b.x, a.y * b.y);
+                return F64(a.x * b.x, a.y * b.y + a.x * b.y + a.y * b.x);
             }   
+
             C64 c64mul(C64 a, C64 b) {
                 return C64(
                     f64mul(a.xy, b.xy) - f64mul(a.zw, b.zw),
@@ -152,25 +137,27 @@
             }   
 
             F64 f64add(F64 a, F64 b) {
-                return f64(a + b);
+                return a + b;
             }   
             
-            float f64mag2(F64 x) {
-                return x.x * x.x +  x.y * x.y;
+            float f64mag2(F64 f) {
+                return f.x * f.x + f.y * f.y + 2.0 * f.x * f.y;
             }
             
             float c64mag2(C64 c) {
-                return f64mag2(f64mul(c.xy, c.xy) + f64mul(c.zw, c.zw));
+                return f64mag2(c.xy) + f64mag2(c.zw);
             }
 
             float iterate(C64 z, C64 c) {
                 for (int i = 0; i < 2048; i++) {
                     if (i >= u_max_iter) break;
                     z = c + C64(f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw), (2. + u_t) * f64mul(z.xy, z.zw));
-                    // z = z^2 + c
                     float mag2 = c64mag2(z);
                     if (mag2 > 64.0) {
-                        return (float(i) - log2(log2(mag2)) + 4.0) / float(u_max_iter);
+                        return float(i) / float(u_max_iter);
+                    }
+                    if (z.w * z.w > 100000000.0) {
+                        return -1.0;
                     }
                 }
                 return 1.0;
@@ -190,7 +177,7 @@
             C64 makeC64(vec2 hi, vec2 lo) {
                 vec4 p;
                 p.xzyw = vec4(hi, lo);
-                return C64(f64(p.xy), f64(p.zw));
+                return p.xyzw;
             }
 
             void main() {
@@ -206,13 +193,15 @@
                         float(aa) * aa_dy
                     );
                     vec4 c = makeC64(
-                        u_pan.xz,
-                        u_pan.yw + (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
+                        u_pan.xy,
+                        (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
                     );
                     vec4 z = vec4(0.0, 0.0, 0.0, 0.0);
                     float t = u_high_precision ? iterate(z, c) : iterate(z.xy, vec2(c.x + c.y, c.z+c.w));
                     vec3 tap = vec3(0.0);
-                    if (u_color_scheme == 1) {
+                    if (t < 0.0) {
+                        tap = vec3(0.0, 1.0, 0.0);
+                    } else if (u_color_scheme == 1) {
                         tap = vec3(
                             clamp(t * 3. - 0., 0.0, 1.0),
                             clamp(t * 3. - 1., 0.0, 1.0),
@@ -288,7 +277,7 @@
         ];
 
         function updateURLFragment() {
-            const fragment = `#x=${state.panX}&y=${state.panY}&zoom=${state.zoom}&t=${state.t}&aa=${state.aaRoot}&iter=${state.maxIterations}`;
+            const fragment = `#x=${state.panX}&y=${state.panY}&zoom=${state.zoom}&t=${state.t}&aa=${state.aaRoot}&iter=${state.maxIterations}&high_precision=${state.highPrecision}`;
             history.replaceState(null, null, fragment);
         }
 
@@ -309,6 +298,7 @@
             elem('aa-value').textContent = state.aaRoot;
             elem('max-iterations-slider').value = Math.log2(state.maxIterations) * 10;
             elem('max-iterations-value').textContent = state.maxIterations;
+            elem('high-precision-checkbox').checked = state.highPrecision;
         }
 
         function initWebGL(gl) {
@@ -335,7 +325,9 @@
                     aaRoot: gl.getUniformLocation(program, 'u_aa_root'),
                     maxIter: gl.getUniformLocation(program, 'u_max_iter'),
                     colorScheme: gl.getUniformLocation(program, 'u_color_scheme'),
-                    highPrecision: gl.getUniformLocation(program, 'u_high_precision')
+                    highPrecision: gl.getUniformLocation(program, 'u_high_precision'),
+                    one: gl.getUniformLocation(program, 'u_one'),
+                    uno: gl.getUniformLocation(program, 'u_uno')
                 }
             };
         }
@@ -345,22 +337,26 @@
             gl.clearColor(0, 0, 0, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
+            /*
             const panX = state.panX;
-            const panXhi = state.panX - (state.panX - Number(Math.floor(state.panX * 65536.0)) / 65536.0);  
+            const panXhi = state.panX - (state.panX - Number(0|(state.panX * 65536.0)) / 65536.0);  
             const panXlo = (state.panX - panXhi);
             const panY = state.panY;
-            const panYhi = state.panY - (state.panY - Number(Math.floor(state.panY * 65536.0)) / 65536.0);
+            const panYhi = state.panY - (state.panY - Number(0|(state.panY * 65536.0)) / 65536.0);
             const panYlo = (state.panY - panYhi);
+            */
 
             gl.uniform2f(uniforms.resolution, width, height);
-            gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
-            //gl.uniform4f(uniforms.pan, state.panX, 0., state.panY, 0.);
+            //gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
+            gl.uniform4f(uniforms.pan, state.panX, state.panY, 0., 0.);
             gl.uniform1f(uniforms.zoom, state.zoom);
             gl.uniform1f(uniforms.t, state.t);
             gl.uniform1i(uniforms.aaRoot, interactive ? 0 : state.aaRoot);
             gl.uniform1i(uniforms.maxIter, state.maxIterations);
             gl.uniform1i(uniforms.colorScheme, currentColorScheme);
             gl.uniform1i(uniforms.highPrecision, state.highPrecision ? 1 : 0);
+            gl.uniform1f(uniforms.one, 1.0);
+            gl.uniform1f(uniforms.uno, 1.0);
 
             gl.drawArrays(gl.TRIANGLES, 0, 6);
         }
