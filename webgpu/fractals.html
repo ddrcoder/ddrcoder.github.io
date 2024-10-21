@@ -28,6 +28,7 @@
 <body>
     <div id="toolbar"
         style="display: flex; align-items: center; color: white; font-family: Helvetica, Arial, sans-serif; gap: 10px;">
+        <button id="reset-button" title="Reset view" onclick="resetView()">↺</button>
         <select id="color-scheme-select" onchange="updateColorScheme(this.value)">
             <option value="0">Ice</option>
             <option value="1">Fire</option>
@@ -87,7 +88,7 @@
 
         function updateHighPrecision(checked) {
             state.highPrecision = checked;
-            drawScene();
+            deferredUpdate();
         }
 
         window.addEventListener('resize', () => {
@@ -108,8 +109,8 @@
         const fragmentShaderSource = `
             precision highp float;
 
-            const float F = 4097.0;
-            const float RF = 1.0 / F;
+            const float F = float(${F});
+            const float RF = float(${RF});
 
             uniform vec2 u_resolution;
             uniform vec4 u_pan;
@@ -122,64 +123,27 @@
             uniform float u_one;
             uniform float u_uno;
 
-            vec2 iteration(vec2 z, vec2 c) {
-                z = vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
-                z += c;
-                return z;
-            } 
-            
+            vec2 csq(vec2 z) {
+                return vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
+            }
+
             #define F64 vec2
             #define C64 vec4
 
-            F64 f64add(F64 a, F64 b) {
-                return a+b;
-                float xh = a.x;
-                float xl = a.y;
-                float yh = b.x;
-                float yl = b.y;
-
-                float sh = xh + yh; float _1 = sh - xh; float sl = (xh - (sh - _1)) + (yh - _1);
-                float th = xl + yl; float _2 = th - xl; float tl = (xl - (th - _2)) + (yl - _2);
-                float c = sl + th;
-                float vh = sh + c; float vl = c - (vh - sh);
-                float w = tl + vl;
-                float zh = vh + w; float zl = w - (zh - vh); 
-
-                return F64(zh, zl);
+            F64 f64mul(F64 a, F64 b) {
+              return F64(a.x * b.x, a.x * b.y + a.y * b.x + a.y * b.y);
             }
 
-            F64 f64mul(F64 x, F64 y) {
-                return F64((x.x + x.y) * (y.x + y.y), 0.);
-                float xh = x.x;
-                float yh = y.x;
-
-                float ch = xh * yh;
-                float c = F * xh; float ah = c - (c - xh); float al = xh - ah;
-                float d = F * yh; float bh = d - (d - yh); float bl = yh - bh;
-                float cl1 = (al*bl) - ((ch - (ah*bh)) - (al*bh) - (ah*bl));
-
-                float b = cl1 + (xh*y.y + x.y*yh);  
-                float xx = ch + b;
-                return F64(b - (xx - ch), xx);
-            }   
-
-            C64 c64add(C64 a, C64 b) {
+            C64 c64sq(C64 z) {
                 return C64(
-                    f64add(a.xy, b.xy),
-                    f64add(a.zw, b.zw)
-                );
-            }
-
-            C64 c64mul(C64 a, C64 b) {
-                return C64(
-                    f64add(f64mul(a.xy, b.xy), -f64mul(a.zw, b.zw)),
-                    f64add(f64mul(a.xy, b.zw), f64mul(a.zw, b.xy))
+                    f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw),
+                    f64mul(z.xy, z.zw) + f64mul(z.zw, z.xy)
                 );
             }   
             
             float f64mag2(F64 f) {
-                f.x += f.y;
-                return f.y * f.y;
+                float v = f.x + f.y;
+                return v * v;
             }
             
             float c64mag2(C64 c) {
@@ -189,14 +153,11 @@
             float iterate(C64 z, C64 c) {
                 for (int i = 0; i < 2048; i++) {
                     if (i >= u_max_iter) break;
-                    z = c64add(c64mul(z, z), c);
-                    float mag2 = c64mag2(z);
-                    if (mag2 > 64.0) {
+                    z = c64sq(z) + c;
+                    float n2 = c64mag2(z);
+                    if (n2 > 64.0) {
                         return float(i) / float(u_max_iter);
                     }
-                    /*if (z.w * z.w > 100000000.0) {
-                        return -1.0;
-                    }*/
                 }
                 return 1.0;
             }
@@ -204,7 +165,7 @@
             float iterate(vec2 z, vec2 c) {
                 for (int i = 0; i < 2048; i++) {
                     if (i >= u_max_iter) break;
-                    z = iteration(z, c);
+                    z = csq(z) + c;
                     if (dot(z, z) > 64.0) {
                         return (float(i) - log2(log2(dot(z, z))) + 4.0) / float(u_max_iter);
                     }
@@ -229,8 +190,8 @@
                         float(aa) * aa_dy
                     );
                     vec4 c = makeC64(
-                        u_pan.xy,
-                        (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
+                        u_pan.xz,
+                        u_pan.yw + (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
                     );
                     vec4 z = vec4(0.0, 0.0, 0.0, 0.0);
                     float t = u_high_precision ? iterate(z, c) : iterate(z.xy, vec2(c.x + c.y, c.z+c.w));
@@ -290,18 +251,22 @@
         const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
         const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
 
-        const state = {
-            panX: 0,
-            panY: 0,
-            zoom: 1,
-            t: 0,
-            aaRoot: 2,
-            maxIterations: 512,
-            isDragging: false,
-            lastX: 0,
-            lastY: 0,
-            highPrecision: false
-        };
+        const state = initState();
+
+        function initState() {
+            return {
+                panX: -0.5,
+                panY: 0,
+                zoom: 0.5,
+                t: 0,
+                aaRoot: 2,
+                maxIterations: 512,
+                isDragging: false,
+                lastX: 0,
+                lastY: 0,
+                highPrecision: false
+            };
+        }
 
         const positions = [
             -1, -1,
@@ -326,7 +291,10 @@
             state.aaRoot = parseInt(params.get('aa')) || state.aaRoot;
             state.maxIterations = Math.max(4, parseInt(params.get('iter')) || state.maxIterations);
             state.highPrecision = params.get('high_precision') === 'true';
+            initUiFromState();
+        }
 
+        function initUiFromState() {    
             const elem = (id => document.getElementById(id));
             elem('t-slider').value = state.t;
             elem('t-value').textContent = state.t.toFixed(2);
@@ -335,6 +303,52 @@
             elem('max-iterations-slider').value = Math.log2(state.maxIterations) * 10;
             elem('max-iterations-value').textContent = state.maxIterations;
             elem('high-precision-checkbox').checked = state.highPrecision;
+        }
+
+        function debugIterations() {
+            // double-double like.
+            var z = [[0,0],[0,0]];
+            var c = [[state.panX, 0.001 / state.zoom], [state.panY, 0.001 / state.zoom]];
+            function assert(b) {
+                if (!b) {
+                    debugger;
+                }
+            }
+            function assertdd(v) {
+                assert(v instanceof Array && v.length == 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]));
+            }
+            function mul(x, y) {
+                assertdd(x);
+                assertdd(y);
+                return [x[0] * y[0], x[0] * y[1] + x[1] * y[0] + x[1] * y[1]];
+            }
+            function add(x, y) {
+                assertdd(x);
+                assertdd(y);
+                return [x[0] + y[0], x[1] + y[1]];
+            }
+            function sub(x, y) {
+                assertdd(x);
+                assertdd(y);
+                return [x[0] - y[0], x[1] - y[1]];
+            }
+            function cmul(a, b) {
+                return [
+                    sub(mul(a[0], b[0]), mul(a[1], b[1])),
+                    add(mul(a[0], b[1]), mul(a[1], b[0])),
+                ];
+            }
+            function cadd(a, b) {
+                return [add(a[0], b[0]), add(a[1], b[1])];
+            }
+
+            console.log(`c: ${c}`);
+            for (var i = 0; i < 10; i++) {
+                console.log(`${i}: z = ${z}`);
+                z = cmul(z, z);
+                console.log(`${i}: z^2 = ${z}`);
+                z = cadd(z, c);
+            }
         }
 
         function initWebGL(gl) {
@@ -369,20 +383,19 @@
         }
 
         function renderFractal(gl, uniforms, state, interactive, width, height) {
+            debugIterations();
             gl.viewport(0, 0, width, height);
             gl.clearColor(0, 0, 0, 1);
             gl.clear(gl.COLOR_BUFFER_BIT);
 
-            const panX = state.panX;
             const panXhi = ((state.panX * F) | 0) * RF;
             const panXlo = state.panX - panXhi;
-            const panY = state.panY;
             const panYhi = ((state.panY * F) | 0) * RF;
             const panYlo = state.panY - panYhi;
 
             gl.uniform2f(uniforms.resolution, width, height);
-            // gl.uniform4f(uniforms.pan, panXhi, panYhi, panXlo, panYlo);
-            gl.uniform4f(uniforms.pan, state.panX, state.panY, 0., 0.);
+            gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
+            gl.uniform4f(uniforms.pan, state.panX, 0, state.panY, 0);
             gl.uniform1f(uniforms.zoom, state.zoom);
             gl.uniform1f(uniforms.t, state.t);
             gl.uniform1i(uniforms.aaRoot, interactive ? 0 : state.aaRoot);
@@ -398,7 +411,11 @@
         // Initialize main canvas
         const { program: mainProgram, uniforms } = initWebGL(gl);
 
-        var pauseAa = false;
+        function deferredUpdate() {
+            updateURLFragment();
+            renderFractal(gl, uniforms, state, false, canvas.width, canvas.height);
+        }
+
         var idleIntervalId = 0;
         function queueIdleDraw() {
             if (idleIntervalId > 0) {
@@ -407,12 +424,13 @@
             }
             idleIntervalId = setInterval(()=>{
                 console.log("idle draw");
-                renderFractal(gl, uniforms, state, false, canvas.width, canvas.height);
+                deferredUpdate();
                 clearInterval(idleIntervalId);
                 idleIntervalId = 0;
             }, IDLE_INTERVAL);
             console.log("queued idle draw");
         }
+
         function drawScene() {
             renderFractal(gl, uniforms, state, true, canvas.width, canvas.height);
             updateURLFragment();
@@ -545,6 +563,12 @@
                 state.isDragging = false;
             }
         });
+
+        function resetView() {
+            Object.assign(state, initState());
+            initUiFromState();
+            deferredUpdate();
+        }
 
         function updateColorScheme(scheme) {
             currentColorScheme = scheme;
