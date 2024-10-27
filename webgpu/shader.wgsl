@@ -2,8 +2,7 @@ struct Uniforms {
     pan: vec2f,
     zoom: f32,
     t: f32,
-    width: u32,
-    height: u32,
+    area: vec2f,
     max_iter: u32,
     color_scheme: u32,
     aa: u32,
@@ -109,25 +108,24 @@ fn iterate(z: C64, c: C64) -> f32 {
     return 1.0;
 }
 
+fn to_frame(uv: vec2f, offset: vec2f) -> vec2f {
+    return (uv * uniforms.area + 200. * fract(offset) - vec2f(0.5)) / uniforms.area.y;
+}
+
 @fragment
 fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
-    let aspect = f32(uniforms.width) / f32(uniforms.height);
-    
-    
     // Accumulate samples for antialiasing
-    let aa :u32 =  uniforms.aa;
+    let aa = uniforms.aa;
     let aa_max = 1 + aa * aa;
-    let div = f32(aa_max * uniforms.height);
-    let aa_dx = f32(aa) / div;
-    let aa_dy = 1.0 / div;
+    let aa_grad = vec2f(f32(aa), 1.0) / f32(aa_max);
     var color = vec3f(0.0);
-    for (var aa : u32 = 0; aa < aa_max; aa++) {
-        let offset = vec2f(
-            fract(f32(aa) * aa_dx),
-            f32(aa) * aa_dy
-        );
-            
-        let uv = (input.uv + offset) * vec2f(aspect, 1.0) / uniforms.zoom + uniforms.pan;
+    var offset = vec2f(0.0);
+
+    for (var a: u32 = 0; a < aa_max; a++) {
+        let uv = to_frame(input.uv, offset) / uniforms.zoom + uniforms.pan;
+        //let uv = (input.uv /* + offset*/) * uniforms.area / uniforms.area.y + uniforms.pan;
+        //let uv = input.uv * 5. - vec2f(2.5);
+
         let c = C64(F64(uv.x, 0.0), F64(uv.y, 0.0));
         let t = iterate(C64(0), c);
         var tap = vec3f(0.0);
@@ -147,6 +145,7 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
             );
         }
         color += tap;
+        offset += aa_grad;
     }
 
     color /= f32(aa_max);

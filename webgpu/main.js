@@ -62,7 +62,8 @@ let antiAliasing = 2;
 let colorScheme = 0;
 let highPrecision = false;
 
-function render() {
+function render(interactive) {
+    updateUniforms(interactive);
     const commandEncoder = device.createCommandEncoder();
     const textureView = context.getCurrentTexture().createView();
 
@@ -83,31 +84,75 @@ function render() {
     device.queue.submit([commandEncoder.finish()]);
 }
 
-function updateUniforms() {
+function renderGood(interactive) {
+    render(false);
+}
+
+function renderFast(interactive) {
+    render(true);
+}
+
+function updateURLFragment() {
+    const url = new URL(window.location.href);
+    url.searchParams.set('t', t.toFixed(4));
+    url.searchParams.set('aa', antiAliasing);
+    url.searchParams.set('maxIter', maxIter);
+    window.history.replaceState({}, '', url);
+}   
+
+function deferredUpdate() {
+    updateURLFragment();
+    requestAnimationFrame(renderGood);
+}
+
+var idleIntervalId = 0;
+let IDLE_INTERVAL = 250;
+function queueIdleDraw() {
+    if (idleIntervalId > 0) {
+        console.log("cancelling idle draw");
+        clearInterval(idleIntervalId);
+    }
+    idleIntervalId = setInterval(()=>{
+        console.log("idle draw");
+        deferredUpdate();
+        clearInterval(idleIntervalId);
+        idleIntervalId = 0;
+    }, IDLE_INTERVAL);
+    console.log("queued idle draw");
+}
+
+function drawScene() {
+    // Request new frame
+    queueIdleDraw();
+    requestAnimationFrame(renderFast);
+}
+
+function updateUniforms(interactive) {
+    const floats = new Float32Array([
+        pan[0],
+        pan[1],
+        zoom,
+        t,
+        canvas.width,
+        canvas.height,
+    ]);
+
     device.queue.writeBuffer(
         uniformBuffer,
         0,
-        new Float32Array([
-            pan[0],
-            pan[1],
-            zoom,
-            t,
-        ])
+        floats
     );
+
+    const ints = new Uint32Array([
+        maxIter,
+        colorScheme,
+        interactive ? 0 : antiAliasing,
+    ]);
     device.queue.writeBuffer(
         uniformBuffer,
-        16,
-        new Uint32Array([
-            canvas.width,
-            canvas.height,
-            maxIter,
-            colorScheme,
-            antiAliasing,
-        ])
+        floats.length * 4,
+        ints
     );
-    
-    // Request new frame
-    requestAnimationFrame(render);
 }
 
 // Event handlers
@@ -124,7 +169,7 @@ function resetView() {
     document.getElementById('max-iterations-value').textContent = '256';
     
     // Update render
-    updateUniforms();
+    drawScene();
 }
 
 canvas.addEventListener('wheel', (e) => {
@@ -149,7 +194,7 @@ canvas.addEventListener('wheel', (e) => {
         pan[1] += y * (1 / zoom - 1 / oldZoom);
     }
 
-    updateUniforms();
+    drawScene();
 });
 
 let isDragging = false;
@@ -171,7 +216,7 @@ canvas.addEventListener('mousemove', (e) => {
     pan[0] -= 2 * dx / zoom / canvas.height;
     pan[1] += 2 * dy / zoom / canvas.height;
 
-    updateUniforms();
+    drawScene();
 });
 
 canvas.addEventListener('mouseup', () => {
@@ -227,7 +272,7 @@ initializeUI();
 function resizeCanvas() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-    updateUniforms();
+    drawScene();
 }
 
 window.addEventListener('resize', resizeCanvas);
@@ -235,32 +280,32 @@ resizeCanvas();
 
 function updateColorScheme(value) {
     colorScheme = parseInt(value);
-    updateUniforms();
+    drawScene();
 }
 
 function updateT(value) {
     t = parseFloat(value);
     document.getElementById('t-value').textContent = t.toFixed(4);
-    updateUniforms();
+    drawScene();
 }
 
 function updateAA(value) {
     antiAliasing = parseInt(value);
     document.getElementById('aa-value').textContent = antiAliasing;
-    updateUniforms();
+    drawScene();
 }
 
 function updateMaxIterations(value) {
     maxIter = Math.floor(value);
     document.getElementById('max-iterations-value').textContent = maxIter;
-    updateUniforms();
+    drawScene();
 }
 
 function updateHighPrecision(checked) {
     highPrecision = checked;
     // Reinitialize pipeline with new precision if needed
     initializePipeline().then(() => {
-        updateUniforms();
+        drawScene();
     });
 }
 
