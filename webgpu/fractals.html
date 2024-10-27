@@ -2,7 +2,7 @@
 <html>
 
 <head>
-    <title>WebGL Fractal</title>
+    <title>WebGPU Fractal</title>
     <style>
         body {
             margin: 0;
@@ -14,648 +14,310 @@
         }
 
         #toolbar {
-            position: absolute;
-            top: 0;
-            left: 0;
-            width: 100%;
+            position: fixed;
+            top: 10px;
+            right: 10px;
+            background: rgba(255, 255, 255, 0.8);
             padding: 10px;
-            background-color: rgba(0, 0, 0, 0.2);
-            z-index: 1000;
+            border-radius: 5px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        #reset-button {
+            margin-right: auto;
+            background-color: #f0f0f0;
+            border: none;
+            padding: 5px 10px;
+            font-size: 16px;
+            cursor: pointer;
+            border-radius: 4px;
         }
     </style>
 </head>
 
 <body>
-    <div id="toolbar"
-        style="display: flex; align-items: center; color: white; font-family: Helvetica, Arial, sans-serif; gap: 10px;">
-        <button id="reset-button" title="Reset view" onclick="resetView()">↺</button>
-        <select id="color-scheme-select" onchange="updateColorScheme(this.value)">
-            <option value="0">Ice</option>
-            <option value="1">Fire</option>
-        </select>
-        <div style="flex-grow: 1; display: flex; align-items: center;">
-            <label for="t-slider">t:</label>
-            <input type="range" id="t-slider" min="-1" max="1" step="0.0001" value="0" oninput="updateT(this.value)"
-                style="flex-grow: 1; margin: 0 10px;">
-            <span id="t-value">0</span>
-        </div>
-        <div style=" display: flex; align-items: center; margin: 10px;">
-            <label for="aa-slider">AA:</label>
-            <input type="range" id="aa-slider" min="0" max="8" step="1" value="2" oninput="updateAA(this.value)"
-                style="flex-grow: 1; margin: 5px;">
-            <span id="aa-value">2</span>
-        </div>
-        <div style=" display: flex; align-items: center; margin: 10px;">
-            <label for="max-iterations-slider" style="white-space: nowrap; margin-right: 10px;">Max Iterations:</label>
-            <input type="range" id="max-iterations-slider" min="0" max="120" step="1" value="80"
-                oninput="updateMaxIterations(Math.pow(2, 0.1 * this.value))" style="flex-grow: 1; margin: 0 5px;">
-            <span id="max-iterations-value">256</span>
-        </div>
-        <div style="display: flex; align-items: center; margin: 10px;">
-            <input type="number" id="export-width" value="1920" min="1" step="1" style="width: 60px;">
-            <span style="margin: 5px 5px;">x</span>
-            <input type="number" id="export-height" value="1080" min="1" step="1" style="width: 60px;">
-            <button id="export-button" onclick="tileExport()" style="margin-left: 10px;">Export PNG</button>
-        </div>
-        <div style="display: flex; align-items: center; margin: 10px;">
-            <label for="high-precision-checkbox">High Precision</label>
-            <input type="checkbox" id="high-precision-checkbox" onchange="updateHighPrecision(this.checked)">
-        </div>
-    </div>
     <canvas id="glcanvas"></canvas>
-    <script>
-        const canvas = document.getElementById('glcanvas');
-        const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
-
-        if (!gl) {
-            alert('Your browser does not support WebGL');
+    <div id="toolbar">
+        <button id="reset-button" title="Reset view">↺</button>
+        <span>Iterations: </span><span id="iter-display">100</span>
+    </div>
+    <script type="module">
+        const canvas = document.querySelector('canvas');
+        
+        // Initialize WebGPU
+        if (!navigator.gpu) {
+            throw new Error('WebGPU not supported');
         }
 
-        const TILE_SIZE = 1024; // Configurable tile size for export
-        const IDLE_INTERVAL = 250;
-        const ColorScheme = {
-            ICE: 0,
-            FIRE: 1
-        };
+        const adapter = await navigator.gpu.requestAdapter();
+        const device = await adapter.requestDevice();
+        const context = canvas.getContext('webgpu');
 
-        let currentColorScheme = ColorScheme.ICE;
-
-        function resizeCanvas() {
-            canvas.width = window.innerWidth;
-            canvas.height = window.innerHeight;
-            gl.viewport(0, 0, gl.canvas.width, gl.canvas.height);
-        }
-
-        function updateHighPrecision(checked) {
-            state.highPrecision = checked;
-            deferredUpdate();
-        }
-
-        window.addEventListener('resize', () => {
-            resizeCanvas();
-            drawScene();
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({
+            device,
+            format,
+            alphaMode: 'premultiplied',
         });
 
-        const vertexShaderSource = `
-            attribute vec2 a_position;
-            void main() {
-                gl_Position = vec4(a_position, 0, 1);
-            }
-        `;
+        // Create uniform buffer
+        const uniformBuffer = device.createBuffer({
+            size: 32, // 4 floats for pan(x,y), zoom, max_iter, t
+            usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+        });
 
-        const F = 4097.0;
-        const RF = 1.0 / F;
+        // Create shader
+        const shaderModule = device.createShaderModule({
+            label: "Fractal shader",
+            code: `
+                struct Uniforms {
+                    pan: vec2f,
+                    zoom: f32,
+                    max_iter: f32,
+                    t: f32,
+                };
+                @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
-        const fragmentShaderSource = `
-            precision highp float;
+                struct VertexOutput {
+                    @builtin(position) position: vec4f,
+                    @location(0) uv: vec2f,
+                };
 
-            const float F = float(${F});
-            const float RF = float(${RF});
-
-            uniform vec2 u_resolution;
-            uniform vec4 u_pan;
-            uniform float u_zoom;
-            uniform float u_t;
-            uniform int u_aa_root;
-            uniform int u_max_iter;
-            uniform int u_color_scheme;
-            uniform bool u_high_precision;
-            uniform float u_one;
-            uniform float u_uno;
-
-            vec2 csq(vec2 z) {
-                return vec2(z.x * z.x - z.y * z.y, (2. + u_t) * z.x * z.y);
-            }
-
-            #define F64 vec2
-            #define C64 vec4
-
-            F64 f64mul(F64 a, F64 b) {
-              return F64(a.x * b.x, a.x * b.y + a.y * b.x + a.y * b.y);
-            }
-
-            C64 c64sq(C64 z) {
-                return C64(
-                    f64mul(z.xy, z.xy) - f64mul(z.zw, z.zw),
-                    f64mul(z.xy, z.zw) + f64mul(z.zw, z.xy)
-                );
-            }   
-            
-            float f64mag2(F64 f) {
-                float v = f.x + f.y;
-                return v * v;
-            }
-            
-            float c64mag2(C64 c) {
-                return f64mag2(c.xy) + f64mag2(c.zw);
-            }
-
-            float iterate(C64 z, C64 c) {
-                for (int i = 0; i < 2048; i++) {
-                    if (i >= u_max_iter) break;
-                    z = c64sq(z) + c;
-                    float n2 = c64mag2(z);
-                    if (n2 > 64.0) {
-                        return float(i) / float(u_max_iter);
-                    }
-                }
-                return 1.0;
-            }
-
-            float iterate(vec2 z, vec2 c) {
-                for (int i = 0; i < 2048; i++) {
-                    if (i >= u_max_iter) break;
-                    z = csq(z) + c;
-                    if (dot(z, z) > 64.0) {
-                        return (float(i) - log2(log2(dot(z, z))) + 4.0) / float(u_max_iter);
-                    }
-                }
-                return 1.0;
-            }
-
-            C64 makeC64(vec2 hi, vec2 lo) {
-                return vec4(hi, lo).xzyw;
-            }
-
-            void main() {
-                vec3 color = vec3(0.0);
-                int aa_max = 1 + u_aa_root * u_aa_root;
-                float aa_dx = float(u_aa_root) / float(aa_max);
-                float aa_dy = 1.0 / float(aa_max);
-                
-                for (int aa = 0; aa < 64; aa++) {
-                    if (aa >= aa_max) break;
-                    vec2 offset = vec2(
-                        fract(float(aa) * aa_dx),
-                        float(aa) * aa_dy
+                @vertex
+                fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
+                    let pos = array(
+                        vec2f(-1.0, -1.0),
+                        vec2f(1.0, -1.0),
+                        vec2f(-1.0, 1.0),
+                        vec2f(1.0, -1.0),
+                        vec2f(1.0, 1.0),
+                        vec2f(-1.0, 1.0),
                     );
-                    vec4 c = makeC64(
-                        u_pan.xz,
-                        u_pan.yw + (gl_FragCoord.xy - u_resolution * 0.5 + offset) / (u_zoom * u_resolution.y)
+
+                    var output: VertexOutput;
+                    output.position = vec4f(pos[vertexIndex], 0.0, 1.0);
+                    output.uv = pos[vertexIndex];
+                    return output;
+                }
+
+                // Your existing F64 and C64 implementations here
+                alias F64 = vec2f;
+                alias C64 = vec4f;
+
+                fn f64add(a: F64, b: F64) -> F64 {
+                    let xh = a.x;
+                    let xl = a.y;
+                    let yh = b.x;
+                    let yl = b.y;
+
+                    let sh = xh + yh;
+                    let sl = xl + yl;
+                    let c = sl + (xh - (sh - yh)) + (yh - (sh - xh));
+                    let zh = sh + c;
+                    let zl = c - (zh - sh);
+
+                    return F64(zh, zl);
+                }
+
+                fn f64mul(x: F64, y: F64) -> F64 {
+                    let xh = x.x;
+                    let xl = x.y;
+                    let yh = y.x;
+                    let yl = y.y;
+
+                    let p = xh * yh;
+                    let q = xh * yl + xl * yh;
+                    let zh = p + q;
+                    let zl = q - (zh - p);
+
+                    return F64(zh, zl);
+                }
+
+                fn c64add(a: C64, b: C64) -> C64 {
+                    C64(
+                        f64add(a.xy, b.xy),
+                        f64add(a.zw, b.zw)
+                    )
+                }
+
+                fn c64mul(a: C64, b: C64) -> C64 {
+                    return C64(
+                        f64add(f64mul(a.xy, b.xy), -f64mul(a.zw, b.zw)),
+                        f64add(f64mul(a.xy, b.zw), f64mul(a.zw, b.xy))
                     );
-                    vec4 z = vec4(0.0, 0.0, 0.0, 0.0);
-                    float t = u_high_precision ? iterate(z, c) : iterate(z.xy, vec2(c.x + c.y, c.z+c.w));
-                    vec3 tap = vec3(0.0);
-                    if (t < 0.0) {
-                        tap = vec3(0.0, 1.0, 0.0);
-                    } else if (u_color_scheme == 1) {
-                        tap = vec3(
-                            clamp(t * 3. - 0., 0.0, 1.0),
-                            clamp(t * 3. - 1., 0.0, 1.0),
-                            clamp(t * 3. - 2., 0.0, 1.0)
-                        );
-                    } else if (u_color_scheme == 0) {
-                        tap = vec3(
-                            clamp(t * 3. - 2., 0.0, 1.0),
-                            clamp(t * 3. - 1., 0.0, 1.0),
-                            clamp(t * 3. - 0., 0.0, 1.0)
-                        );
+                }
+
+                fn f64mag2(f: F64) -> f32 {
+                    return f.x * f.x + 2.0 * f.x * f.y + f.y * f.y;
+                }
+
+                fn c64mag2(c: C64) -> f32 {
+                    return f64mag2(c.xy) + f64mag2(c.zw);
+                }
+
+                fn iterate(z: C64, c: C64) -> f32 {
+                    var z_current = z;
+                    for (var i: i32 = 0; i < 2048; i++) {
+                        if (f32(i) >= uniforms.max_iter) { break; }
+                        z_current = c64add(c64mul(z_current, z_current), c);
+                        let mag2 = c64mag2(z_current);
+                        if (mag2 > 64.0) {
+                            return (f32(i) - log2(log2(mag2)) + 4.0) / uniforms.max_iter;
+                        }
                     }
-                    color += tap;
+                    return 1.0;
                 }
 
-                color /= float(aa_max);
-                gl_FragColor = vec4(color, 1.0);
-            }
-        `;
-
-        function createShader(gl, type, source) {
-            const shader = gl.createShader(type);
-            gl.shaderSource(shader, source);
-            gl.compileShader(shader);
-
-            const success = gl.getShaderParameter(shader, gl.COMPILE_STATUS);
-            if (success) {
-                return shader;
-            }
-
-            alert(gl.getShaderInfoLog(shader));
-            gl.deleteShader(shader);
-        }
-
-        function createProgram(gl, vertexShader, fragmentShader) {
-            const program = gl.createProgram();
-            gl.attachShader(program, vertexShader);
-            gl.attachShader(program, fragmentShader);
-            gl.linkProgram(program);
-
-            const success = gl.getProgramParameter(program, gl.LINK_STATUS);
-            if (success) {
-                return program;
-            }
-
-            console.error(gl.getProgramInfoLog(program));
-            gl.deleteProgram(program);
-        }
-
-        const vertexShader = createShader(gl, gl.VERTEX_SHADER, vertexShaderSource);
-        const fragmentShader = createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource);
-
-        const state = initState();
-
-        function initState() {
-            return {
-                panX: -0.5,
-                panY: 0,
-                zoom: 0.5,
-                t: 0,
-                aaRoot: 2,
-                maxIterations: 512,
-                isDragging: false,
-                lastX: 0,
-                lastY: 0,
-                highPrecision: false
-            };
-        }
-
-        const positions = [
-            -1, -1,
-            1, -1,
-            -1, 1,
-            -1, 1,
-            1, -1,
-            1, 1
-        ];
-
-        function updateURLFragment() {
-            const fragment = `#x=${state.panX}&y=${state.panY}&zoom=${state.zoom}&t=${state.t}&aa=${state.aaRoot}&iter=${state.maxIterations}&high_precision=${state.highPrecision}`;
-            history.replaceState(null, null, fragment);
-        }
-
-        function initStateFromURL() {
-            const params = new URLSearchParams(window.location.hash.slice(1));
-            state.panX = parseFloat(params.get('x')) || state.panX;
-            state.panY = parseFloat(params.get('y')) || state.panY;
-            state.zoom = parseFloat(params.get('zoom')) || state.zoom;
-            state.t = parseFloat(params.get('t')) || state.t;
-            state.aaRoot = parseInt(params.get('aa')) || state.aaRoot;
-            state.maxIterations = Math.max(4, parseInt(params.get('iter')) || state.maxIterations);
-            state.highPrecision = params.get('high_precision') === 'true';
-            initUiFromState();
-        }
-
-        function initUiFromState() {    
-            const elem = (id => document.getElementById(id));
-            elem('t-slider').value = state.t;
-            elem('t-value').textContent = state.t.toFixed(2);
-            elem('aa-slider').value = state.aaRoot;
-            elem('aa-value').textContent = state.aaRoot;
-            elem('max-iterations-slider').value = Math.log2(state.maxIterations) * 10;
-            elem('max-iterations-value').textContent = state.maxIterations;
-            elem('high-precision-checkbox').checked = state.highPrecision;
-        }
-
-        function debugIterations() {
-            // double-double like.
-            var z = [[0,0],[0,0]];
-            var c = [[state.panX, 0.001 / state.zoom], [state.panY, 0.001 / state.zoom]];
-            function assert(b) {
-                if (!b) {
-                    debugger;
+                @fragment
+                fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
+                    let aspect = 1.0;
+                    let uv = input.uv * vec2f(aspect, 1.0) * uniforms.zoom + uniforms.pan;
+                    
+                    let c = C64(F64(uv.x, 0.0), F64(uv.y, 0.0));
+                    let z = C64(F64(0.0, 0.0), F64(0.0, 0.0));
+                    
+                    let t = iterate(z, c);
+                    
+                    // Color mapping
+                    let color = vec3f(
+                        0.5 + 0.5 * cos(3.0 + t * 6.28 + vec3f(0.0, 0.6, 1.0))
+                    );
+                    
+                    return vec4f(color, 1.0);
                 }
-            }
-            function assertdd(v) {
-                assert(v instanceof Array && v.length == 2 && Number.isFinite(v[0]) && Number.isFinite(v[1]));
-            }
-            function mul(x, y) {
-                assertdd(x);
-                assertdd(y);
-                return [x[0] * y[0], x[0] * y[1] + x[1] * y[0] + x[1] * y[1]];
-            }
-            function add(x, y) {
-                assertdd(x);
-                assertdd(y);
-                return [x[0] + y[0], x[1] + y[1]];
-            }
-            function sub(x, y) {
-                assertdd(x);
-                assertdd(y);
-                return [x[0] - y[0], x[1] - y[1]];
-            }
-            function cmul(a, b) {
-                return [
-                    sub(mul(a[0], b[0]), mul(a[1], b[1])),
-                    add(mul(a[0], b[1]), mul(a[1], b[0])),
-                ];
-            }
-            function cadd(a, b) {
-                return [add(a[0], b[0]), add(a[1], b[1])];
-            }
-
-            console.log(`c: ${c}`);
-            for (var i = 0; i < 10; i++) {
-                console.log(`${i}: z = ${z}`);
-                z = cmul(z, z);
-                console.log(`${i}: z^2 = ${z}`);
-                z = cadd(z, c);
-            }
-        }
-
-        function initWebGL(gl) {
-            const program = createProgram(gl,
-                createShader(gl, gl.VERTEX_SHADER, vertexShaderSource),
-                createShader(gl, gl.FRAGMENT_SHADER, fragmentShaderSource));
-            gl.useProgram(program);
-
-            const positionAttributeLocation = gl.getAttribLocation(program, 'a_position');
-            const positionBuffer = gl.createBuffer();
-            gl.bindBuffer(gl.ARRAY_BUFFER, positionBuffer);
-            gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(positions), gl.STATIC_DRAW);
-
-            gl.enableVertexAttribArray(positionAttributeLocation);
-            gl.vertexAttribPointer(positionAttributeLocation, 2, gl.FLOAT, false, 0, 0);
-
-            return {
-                program,
-                uniforms: {
-                    resolution: gl.getUniformLocation(program, 'u_resolution'),
-                    pan: gl.getUniformLocation(program, 'u_pan'),
-                    zoom: gl.getUniformLocation(program, 'u_zoom'),
-                    t: gl.getUniformLocation(program, 'u_t'),
-                    aaRoot: gl.getUniformLocation(program, 'u_aa_root'),
-                    maxIter: gl.getUniformLocation(program, 'u_max_iter'),
-                    colorScheme: gl.getUniformLocation(program, 'u_color_scheme'),
-                    highPrecision: gl.getUniformLocation(program, 'u_high_precision'),
-                    one: gl.getUniformLocation(program, 'u_one'),
-                    uno: gl.getUniformLocation(program, 'u_uno')
-                }
-            };
-        }
-
-        function renderFractal(gl, uniforms, state, interactive, width, height) {
-            debugIterations();
-            gl.viewport(0, 0, width, height);
-            gl.clearColor(0, 0, 0, 1);
-            gl.clear(gl.COLOR_BUFFER_BIT);
-
-            const panXhi = ((state.panX * F) | 0) * RF;
-            const panXlo = state.panX - panXhi;D
-            const panYhi = ((state.panY * F) | 0) * RF;
-            const panYlo = state.panY - panYhi;
-
-            gl.uniform2f(uniforms.resolution, width, height);
-            gl.uniform4f(uniforms.pan, panXhi, panXlo, panYhi, panYlo);
-            gl.uniform4f(uniforms.pan, state.panX, 0, state.panY, 0);
-            gl.uniform1f(uniforms.zoom, state.zoom);
-            gl.uniform1f(uniforms.t, state.t);
-            gl.uniform1i(uniforms.aaRoot, interactive ? 0 : state.aaRoot);
-            gl.uniform1i(uniforms.maxIter, state.maxIterations);
-            gl.uniform1i(uniforms.colorScheme, currentColorScheme);
-            gl.uniform1i(uniforms.highPrecision, state.highPrecision ? 1 : 0);
-            gl.uniform1f(uniforms.one, 1.0);
-            gl.uniform1f(uniforms.uno, 1.0);
-
-            gl.drawArrays(gl.TRIANGLES, 0, 6);
-        }
-
-        // Initialize main canvas
-        const { program: mainProgram, uniforms } = initWebGL(gl);
-
-        function deferredUpdate() {
-            updateURLFragment();
-            renderFractal(gl, uniforms, state, false, canvas.width, canvas.height);
-        }
-
-        var idleIntervalId = 0;
-        function queueIdleDraw() {
-            if (idleIntervalId > 0) {
-                console.log("cancelling idle draw");
-                clearInterval(idleIntervalId);
-            }
-            idleIntervalId = setInterval(()=>{
-                console.log("idle draw");
-                deferredUpdate();
-                clearInterval(idleIntervalId);
-                idleIntervalId = 0;
-            }, IDLE_INTERVAL);
-            console.log("queued idle draw");
-        }
-
-        function drawScene() {
-            renderFractal(gl, uniforms, state, true, canvas.width, canvas.height);
-            updateURLFragment();
-            queueIdleDraw();
-        }
-
-        // Call this function to initialize state from URL
-        initStateFromURL();
-
-        // Initial setup and draw
-        resizeCanvas();
-        drawScene();
-
-        // Update event listeners
-        canvas.addEventListener('mousedown', (e) => {
-            state.isDragging = true;
-            state.lastX = e.clientX;
-            state.lastY = e.clientY;
+            `
         });
 
-        canvas.addEventListener('mousemove', (e) => {
-            if (state.isDragging) {
-                const dx = e.clientX - state.lastX;
-                const dy = e.clientY - state.lastY;
-
-                state.panX -= dx / (state.zoom * canvas.height);
-                state.panY += dy / (state.zoom * canvas.height);
-
-                state.lastX = e.clientX;
-                state.lastY = e.clientY;
-
-                drawScene();
-            }
+        // Create pipeline
+        const pipeline = device.createRenderPipeline({
+            layout: 'auto',
+            vertex: {
+                module: shaderModule,
+                entryPoint: 'vertexMain',
+            },
+            fragment: {
+                module: shaderModule,
+                entryPoint: 'fragmentMain',
+                targets: [{
+                    format,
+                }],
+            },
         });
 
-        canvas.addEventListener('mouseup', () => {
-            state.isDragging = false;
+        // Create bind group
+        const bindGroup = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [{
+                binding: 0,
+                resource: {
+                    buffer: uniformBuffer,
+                },
+            }],
         });
 
-        canvas.addEventListener('mouseleave', () => {
-            state.isDragging = false;
-        });
+        // State variables
+        let pan = [0, 0];
+        let zoom = 1;
+        let maxIter = 100;
+        let t = 0;
+
+        function updateUniforms() {
+            device.queue.writeBuffer(
+                uniformBuffer,
+                0,
+                new Float32Array([...pan, zoom, maxIter, t])
+            );
+        }
+
+        function draw() {
+            const commandEncoder = device.createCommandEncoder();
+            const textureView = context.getCurrentTexture().createView();
+
+            const renderPass = commandEncoder.beginRenderPass({
+                colorAttachments: [{
+                    view: textureView,
+                    clearValue: { r: 0, g: 0, b: 0, a: 1 },
+                    loadOp: 'clear',
+                    storeOp: 'store',
+                }],
+            });
+
+            renderPass.setPipeline(pipeline);
+            renderPass.setBindGroup(0, bindGroup);
+            renderPass.draw(6);
+            renderPass.end();
+
+            device.queue.submit([commandEncoder.finish()]);
+        }
+
+        // Event handlers
+        function resetView() {
+            pan = [0, 0];
+            zoom = 1;
+            maxIter = 100;
+            t = 0;
+            updateUniforms();
+            draw();
+        }
 
         canvas.addEventListener('wheel', (e) => {
             e.preventDefault();
-            const delta = e.deltaY * -0.001;
-            const zoomFactor = Math.exp(delta);
-
-            state.zoom *= zoomFactor;
-
-            // Adjust pan to zoom towards mouse position
+            const factor = e.deltaY > 0 ? 1.1 : 0.9;
+            zoom *= factor;
+            
+            // Zoom toward mouse position
             const rect = canvas.getBoundingClientRect();
-            const x = e.clientX - rect.left;
-            const y = e.clientY - rect.top;
-
-            const cx = (x / canvas.width - 0.5) * 2.0;
-            const cy = (y / canvas.height - 0.5) * -2.0;
-
-            state.panX += cx * (1 - 1 / zoomFactor) / state.zoom;
-            state.panY += cy * (1 - 1 / zoomFactor) / state.zoom;
-
-            drawScene();
+            const x = (e.clientX - rect.left) / rect.width * 2 - 1;
+            const y = (e.clientY - rect.top) / rect.height * 2 - 1;
+            
+            pan[0] += x * (1 - factor) / zoom;
+            pan[1] += y * (1 - factor) / zoom;
+            
+            updateUniforms();
+            draw();
         });
 
-        let lastTouchDistance = 0;
-        let lastTouchX = 0;
-        let lastTouchY = 0;
+        let isDragging = false;
+        let lastX, lastY;
 
-        canvas.addEventListener('touchstart', (e) => {
-            if (e.touches.length == 1) {
-                state.isDragging = true;
-                state.lastX = e.touches[0].clientX;
-                state.lastY = e.touches[0].clientY;
-            } else if (e.touches.length == 2) {
-                state.isDragging = false;
-                const dx = e.touches[0].clientX - e.touches[1].clientX;
-                const dy = e.touches[0].clientY - e.touches[1].clientY;
-                lastTouchDistance = Math.sqrt(dx * dx + dy * dy);
-                lastTouchX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                lastTouchY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-            }
+        canvas.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            lastX = e.clientX;
+            lastY = e.clientY;
         });
 
-        canvas.addEventListener('touchmove', (e) => {
-            e.preventDefault();
-            if (e.touches.length == 1 && state.isDragging) {
-                const dx = e.touches[0].clientX - state.lastX;
-                const dy = e.touches[0].clientY - state.lastY;
+        canvas.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const dx = e.clientX - lastX;
+            const dy = e.clientY - lastY;
+            lastX = e.clientX;
+            lastY = e.clientY;
 
-                state.panX -= dx / (state.zoom * canvas.height);
-                state.panY += dy / (state.zoom * canvas.height);
-
-                state.lastX = e.touches[0].clientX;
-                state.lastY = e.touches[0].clientY;
-
-                drawScene();
-            } else if (e.touches.length == 2) {
-                const dx = e.touches[0].clientX - e.touches[1].clientX;
-                const dy = e.touches[0].clientY - e.touches[1].clientY;
-                const touchDistance = Math.sqrt(dx * dx + dy * dy);
-
-                const zoomFactor = touchDistance / lastTouchDistance;
-
-                state.zoom *= zoomFactor;
-
-                // Adjust pan to zoom towards touch center
-                const rect = canvas.getBoundingClientRect();
-                const x = (e.touches[0].clientX + e.touches[1].clientX) / 2 - rect.left;
-                const y = (e.touches[0].clientY + e.touches[1].clientY) / 2 - rect.top;
-
-                const cx = (x / canvas.width - 0.5) * 2.0;
-                const cy = (y / canvas.height - 0.5) * -2.0;
-
-                state.panX += cx * (1 - 1 / zoomFactor) / state.zoom;
-                state.panY += cy * (1 - 1 / zoomFactor) / state.zoom;
-
-                lastTouchDistance = touchDistance;
-                lastTouchX = x;
-                lastTouchY = y;
-
-                drawScene();
-            }
+            pan[0] -= dx * 2 / canvas.width / zoom;
+            pan[1] -= dy * 2 / canvas.height / zoom;
+            
+            updateUniforms();
+            draw();
         });
 
-        canvas.addEventListener('touchend', (e) => {
-            if (e.touches.length < 2) {
-                lastTouchDistance = 0;
-            }
-            if (e.touches.length == 0) {
-                state.isDragging = false;
-            }
+        canvas.addEventListener('mouseup', () => {
+            isDragging = false;
         });
 
-        function resetView() {
-            Object.assign(state, initState());
-            initUiFromState();
-            deferredUpdate();
+        document.getElementById('reset-button').addEventListener('click', resetView);
+
+        // Initial setup
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+            draw();
         }
 
-        function updateColorScheme(scheme) {
-            currentColorScheme = scheme;
-            drawScene();
-        }
-
-        function updateT(value) {
-            state.t = parseFloat(value);
-            document.getElementById('t-value').textContent = state.t.toFixed(2);
-            drawScene();
-        }
-
-        function updateAA(value) {
-            state.aaRoot = parseInt(value);
-            document.getElementById('aa-value').textContent = state.aaRoot;
-            drawScene();
-        }
-
-        function updateMaxIterations(value) {
-            state.maxIterations = parseInt(value);
-            document.getElementById('max-iterations-value').textContent = state.maxIterations;
-            drawScene();
-        }
-
-        function tileExport() {
-            const width = parseInt(document.getElementById('export-width').value);
-            const height = parseInt(document.getElementById('export-height').value);
-
-            const exportCanvas = document.createElement('canvas');
-            exportCanvas.width = width;
-            exportCanvas.height = height;
-            const exportCtx = exportCanvas.getContext('2d');
-
-            const tileCountX = Math.ceil(width / TILE_SIZE);
-            const tileCountY = Math.ceil(height / TILE_SIZE);
-
-            let tilesDone = 0;
-            const totalTiles = tileCountX * tileCountY;
-
-            // Calculate the effective zoom for the export
-            const exportZoom = state.zoom * height / TILE_SIZE;
-
-            for (let tileY = 0; tileY < tileCountY; tileY++) {
-                for (let tileX = 0; tileX < tileCountX; tileX++) {
-                    // Set up a temporary canvas for this tile
-                    const tileCanvas = document.createElement('canvas');
-                    tileCanvas.width = TILE_SIZE;
-                    tileCanvas.height = TILE_SIZE;
-                    const tileGl = tileCanvas.getContext('webgl') || tileCanvas.getContext('experimental-webgl');
-
-                    // Set up WebGL context for this tile
-                    const { uniforms: tileUniforms } = initWebGL(tileGl);
-
-                    // Calculate adjusted pan for this tile
-                    const centerX = state.panX + (tileX - (tileCountX - 1) / 2) * TILE_SIZE / (state.zoom * height);
-                    const centerY = state.panY - (tileY - (tileCountY - 1) / 2) * TILE_SIZE / (state.zoom * height);
-
-                    // Render fractal for this tile with the adjusted zoom
-                    renderFractal(tileGl, tileUniforms, {
-                        ...state,
-                        panX: centerX,
-                        panY: centerY,
-                        zoom: exportZoom,
-                        aaRoot: 8,
-                    }, false, TILE_SIZE, TILE_SIZE);
-
-                    exportCtx.drawImage(tileCanvas, tileX * TILE_SIZE, tileY * TILE_SIZE);
-
-                    tilesDone++;
-                    console.log(`Rendered tile ${tilesDone}/${totalTiles}`);
-                }
-            }
-
-            const link = document.createElement('a');
-            link.download = `fractal_${width}x${height}.png`;
-            link.href = exportCanvas.toDataURL('image/png');
-            link.click();
-        }
-
-        function exportImage() {
-            console.log('Exporting image...');
-            tileExport();
-        }
-
-        document.addEventListener('DOMContentLoaded', () => {
-            resizeCanvas();
-            drawScene();
-        });
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas();
+        updateUniforms();
+        draw();
     </script>
 </body>
