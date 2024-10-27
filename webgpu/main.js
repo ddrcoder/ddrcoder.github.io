@@ -91,13 +91,18 @@ function updateUniforms() {
             pan[0],
             pan[1],
             zoom,
-            maxIter,
             t,
+        ])
+    );
+    device.queue.writeBuffer(
+        uniformBuffer,
+        16,
+        new Uint32Array([
             canvas.width,
             canvas.height,
+            maxIter,
             colorScheme,
             antiAliasing,
-            highPrecision ? 1 : 0,
         ])
     );
     
