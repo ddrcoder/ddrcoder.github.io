@@ -38,11 +38,40 @@
 </head>
 
 <body>
-    <canvas id="glcanvas"></canvas>
-    <div id="toolbar">
+    <div id="toolbar"
+        style="display: flex; align-items: center; color: white; font-family: Helvetica, Arial, sans-serif; gap: 10px;">
         <button id="reset-button" title="Reset view">↺</button>
-        <span>Iterations: </span><span id="iter-display">100</span>
+        <select id="color-scheme-select">
+            <option value="0">Ice</option>
+            <option value="1">Fire</option>
+        </select>
+        <div style="flex-grow: 1; display: flex; align-items: center;">
+            <label for="t-slider">t:</label>
+            <input type="range" id="t-slider" min="-1" max="1" step="0.0001" value="0" style="flex-grow: 1; margin: 0 10px;">
+            <span id="t-value">0</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 10px;">
+            <label for="aa-slider">AA:</label>
+            <input type="range" id="aa-slider" min="0" max="8" step="1" value="2" style="flex-grow: 1; margin: 5px;">
+            <span id="aa-value">2</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 10px;">
+            <label for="max-iterations-slider" style="white-space: nowrap; margin-right: 10px;">Max Iterations:</label>
+            <input type="range" id="max-iterations-slider" min="0" max="120" step="1" value="80" style="flex-grow: 1; margin: 0 5px;">
+            <span id="max-iterations-value">256</span>
+        </div>
+        <div style="display: flex; align-items: center; margin: 10px;">
+            <input type="number" id="export-width" value="1920" min="1" step="1" style="width: 60px;">
+            <span style="margin: 5px 5px;">x</span>
+            <input type="number" id="export-height" value="1080" min="1" step="1" style="width: 60px;">
+            <button id="export-button" style="margin-left: 10px;">Export PNG</button>
+        </div>
+        <div style="display: flex; align-items: center; margin: 10px;">
+            <label for="high-precision-checkbox">High Precision</label>
+            <input type="checkbox" id="high-precision-checkbox">
+        </div>
     </div>
+    <canvas id="glcanvas"></canvas>
     <script type="module" src="./main.js"/>
     </script>
 </body>
