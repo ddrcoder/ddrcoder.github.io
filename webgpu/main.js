@@ -54,7 +54,7 @@ const bindGroup = device.createBindGroup({
 });
 
 // State variables
-let pan = [0, 0];
+let pan = [-0.5, 0];
 let zoom = 1;
 let maxIter = 100;
 let t = 0;
@@ -97,7 +97,22 @@ function updateURLFragment() {
     url.searchParams.set('t', t.toFixed(4));
     url.searchParams.set('aa', antiAliasing);
     url.searchParams.set('maxIter', maxIter);
+    url.searchParams.set('high_precision', highPrecision);
+    url.searchParams.set('panX', pan[0]);
+    url.searchParams.set('panY', pan[1]);
+    url.searchParams.set('zoom', zoom);
     window.history.replaceState({}, '', url);
+}   
+
+function initStateFromURL() {
+    const url = new URL(window.location.href);
+    t = parseFloat(url.searchParams.get('t')) || t;
+    antiAliasing = parseInt(url.searchParams.get('aa')) || antiAliasing;
+    maxIter = parseInt(url.searchParams.get('maxIter')) || maxIter;
+    highPrecision = url.searchParams.get('high_precision') === 'true';
+    pan[0] = parseFloat(url.searchParams.get('panX')) || pan[0];
+    pan[1] = parseFloat(url.searchParams.get('panY')) || pan[1];
+    zoom = parseFloat(url.searchParams.get('zoom')) || zoom;
 }   
 
 function deferredUpdate() {
@@ -175,18 +190,17 @@ function resetView() {
 canvas.addEventListener('wheel', (e) => {
     e.preventDefault();
 
-    const factor = Math.exp(e.deltaY * 0.001);
     if (e.shiftKey) {
         // Change maxIter logarithmically
-        maxIter = Math.max(1, maxIter * factor);
+        maxIter = Math.max(1, maxIter * Math.exp(e.deltaY * 0.0002));
         const maxIterValue = document.getElementById('max-iterations-value');
         const maxIterSlider = document.getElementById('max-iterations-slider');
         maxIterSlider.value = Math.log2(maxIter) * 10;
         maxIterValue.textContent = maxIter;
-    } else {
+    } {
         // Normal zoom behavior
         const oldZoom = zoom;
-        zoom *= factor;
+        zoom *= Math.exp(e.deltaY * 0.001);
         const rect = canvas.getBoundingClientRect();
         const x = ((e.clientX - rect.left) / rect.width * 2 - 1) * rect.width / rect.height;
         const y = (e.clientY - rect.top) / rect.height * 2 - 1;
@@ -224,6 +238,8 @@ canvas.addEventListener('mouseup', () => {
 });
 
 function initializeUI() {
+    initStateFromURL();
+
     // Reset button
     const resetButton = document.getElementById('reset-button');
     resetButton.addEventListener('click', resetView);
@@ -235,6 +251,8 @@ function initializeUI() {
     // T slider
     const tSlider = document.getElementById('t-slider');
     const tValue = document.getElementById('t-value');
+    tSlider.value = t.toFixed(4);
+    tValue.textContent = t.toFixed(4);
     tSlider.addEventListener('input', (e) => {
         updateT(e.target.value);
         tValue.textContent = t.toFixed(4);
@@ -243,6 +261,8 @@ function initializeUI() {
     // Anti-aliasing slider
     const aaSlider = document.getElementById('aa-slider');
     const aaValue = document.getElementById('aa-value');
+    aaSlider.value = antiAliasing;
+    aaValue.textContent = antiAliasing;
     aaSlider.addEventListener('input', (e) => {
         updateAA(e.target.value);
         aaValue.textContent = antiAliasing;
@@ -251,6 +271,8 @@ function initializeUI() {
     // Max iterations slider
     const maxIterSlider = document.getElementById('max-iterations-slider');
     const maxIterValue = document.getElementById('max-iterations-value');
+    maxIterSlider.value = Math.log2(maxIter) * 10;
+    maxIterValue.textContent = maxIter;
     maxIterSlider.addEventListener('input', (e) => {
         updateMaxIterations(Math.pow(2, 0.1 * e.target.value));
         maxIterValue.textContent = maxIter;

@@ -109,7 +109,7 @@ fn iterate(z: C64, c: C64) -> f32 {
 }
 
 fn to_frame(uv: vec2f, offset: vec2f) -> vec2f {
-    return (uv * uniforms.area + 200. * fract(offset) - vec2f(0.5)) / uniforms.area.y;
+    return (uv * uniforms.area + fract(offset) - vec2f(0.5)) / uniforms.area.y;
 }
 
 @fragment
