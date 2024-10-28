@@ -162,6 +162,7 @@ function updateUniforms(interactive) {
         maxIter,
         colorScheme,
         interactive ? 0 : antiAliasing,
+        highPrecision ? 1 : 0,
     ]);
     device.queue.writeBuffer(
         uniformBuffer,
@@ -325,10 +326,7 @@ function updateMaxIterations(value) {
 
 function updateHighPrecision(checked) {
     highPrecision = checked;
-    // Reinitialize pipeline with new precision if needed
-    initializePipeline().then(() => {
-        drawScene();
-    });
+    drawScene();
 }
 
 async function tileExport() {

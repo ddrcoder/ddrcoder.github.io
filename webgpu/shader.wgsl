@@ -6,6 +6,7 @@ struct Uniforms {
     max_iter: u32,
     color_scheme: u32,
     aa: u32,
+    high_precision: u32,
 };
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
 
@@ -34,57 +35,18 @@ fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOutput {
 alias F64 = vec2f;
 alias C64 = vec4f;
 
-fn f64add(a: F64, b: F64) -> F64 {
-    let xh = a.x;
-    let xl = a.y;
-    let yh = b.x;
-    let yl = b.y;
-
-    let sh = xh + yh;
-    let sl = xl + yl;
-    let c = sl + (xh - (sh - yh)) + (yh - (sh - xh));
-    let zh = sh + c;
-    let zl = c - (zh - sh);
-
-    return F64(zh, zl);
-}
-
 fn f64mul(x: F64, y: F64) -> F64 {
-    let xh = x.x;
-    let xl = x.y;
-    let yh = y.x;
-    let yl = y.y;
-
-    let p = xh * yh;
-    let q = xh * yl + xl * yh;
-    let zh = p + q;
-    let zl = q - (zh - p);
-
-    return F64(zh, zl);
+    return vec2f(x.x * y.x, x.x * y.y + x.y * y.x + x.y * y.y);
 }
 
 fn f64sq(v: F64) -> F64 {
     return f64mul(v, v);
 }
 
-fn c64add(a: C64, b: C64) -> C64 {
-    return C64(
-        f64add(a.xy, b.xy),
-        f64add(a.zw, b.zw)
-    );
-}
-
-fn c64mul(a: C64, b: C64) -> C64 {
-    return C64(
-        f64add(f64mul(a.xy, b.xy), -f64mul(a.zw, b.zw)),
-        f64add(f64mul(a.xy, b.zw), f64mul(a.zw, b.xy))
-    );
-}
-
 fn c64sq(v: C64) -> C64 {
     return C64(
-        f64add(f64mul(v.xy, v.xy), -f64mul(v.zw, v.zw)),
-        (2 + uniforms.t) * f64mul(v.zw, v.xy)
+        f64sq(v.xy) - f64sq(v.zw),
+        (2.0 + uniforms.t) * f64mul(v.zw, v.xy)
     );
 }
 
@@ -96,11 +58,23 @@ fn c64mag2(c: C64) -> f32 {
     return f64mag2(c.xy) + f64mag2(c.zw);
 }
 
-fn iterate(z: C64, c: C64) -> f32 {
-    var z_current = z;
+fn iterate_high_precision(z0: C64, c: C64) -> f32 {
+    var z = z0;
     for (var i: u32 = 0; i < uniforms.max_iter; i++) {
-        z_current = c64add(c64sq(z_current), c);
-        let mag2 = c64mag2(z_current);
+        z = c64sq(z) + c;
+        let mag2 = c64mag2(z);
+        if (mag2 > 64.0) {
+            return (f32(i) - log2(log2(mag2)) + 4.0) / f32(uniforms.max_iter);
+        }
+    }
+    return 1.0;
+}
+
+fn iterate_low_precision(z0: vec2f, c: vec2f) -> f32 {
+    var z = z0;
+    for (var i: u32 = 0; i < uniforms.max_iter; i++) {
+        z = vec2f(z.x * z.x - z.y * z.y, (2.0 + uniforms.t) * z.x * z.y) + c;
+        let mag2 = z.x * z.x + z.y * z.y;
         if (mag2 > 64.0) {
             return (f32(i) - log2(log2(mag2)) + 4.0) / f32(uniforms.max_iter);
         }
@@ -122,12 +96,14 @@ fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
     var offset = vec2f(0.0);
 
     for (var a: u32 = 0; a < aa_max; a++) {
-        let uv = to_frame(input.uv, offset) / uniforms.zoom + uniforms.pan;
-        //let uv = (input.uv /* + offset*/) * uniforms.area / uniforms.area.y + uniforms.pan;
-        //let uv = input.uv * 5. - vec2f(2.5);
+        let uv = vec4f(uniforms.pan, to_frame(input.uv, offset) / uniforms.zoom);
 
-        let c = C64(F64(uv.x, 0.0), F64(uv.y, 0.0));
-        let t = iterate(C64(0), c);
+        var t = 0.;
+        if (uniforms.high_precision == 0) {
+            t = iterate_low_precision(vec2f(0), uv.xy + uv.zw);
+        } else {
+            t = iterate_high_precision(C64(0), uv.xzyw);
+        }
         var tap = vec3f(0.0);
         if (t < 0.0) {
             tap = vec3f(0.0, 1.0, 0.0);
