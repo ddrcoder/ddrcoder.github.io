@@ -58,28 +58,53 @@ fn c64mag2(c: C64) -> f32 {
     return f64mag2(c.xy) + f64mag2(c.zw);
 }
 
+fn f64_fix(f: F64) -> F64 {
+    let y = f.y * (1.0 / 256.0);
+    return F64(f.x + f.y - y, y);
+}
+
+fn c64_fix(c: C64) -> C64 {
+    return C64(f64_fix(c.xy), f64_fix(c.zw));
+}
+
 fn iterate_high_precision(z0: C64, c: C64) -> f32 {
     var z = z0;
-    for (var i: u32 = 0; i < uniforms.max_iter; i++) {
+    var e = 0;
+    for (var i: u32 = 0; i < 8192; i++) {
         z = c64sq(z) + c;
         let mag2 = c64mag2(z);
         if (mag2 > 64.0) {
             return (f32(i) - log2(log2(mag2)) + 4.0) / f32(uniforms.max_iter);
         }
+        if (dot(z.yw, z.yw) > 1e-3) {
+            z = c64_fix(z);
+        }
+        if (i > uniforms.max_iter) {
+            return 1.0;
+        }
     }
     return 1.0;
 }
 
+fn mag2(z: vec2f) -> f32 {
+    return z.x * z.x + z.y * z.y;
+}
+
 fn iterate_low_precision(z0: vec2f, c: vec2f) -> f32 {
     var z = z0;
+    var zd = vec2f(0.0);
+
     for (var i: u32 = 0; i < uniforms.max_iter; i++) {
+        // zd * z = (zdr + zdi) * (z.x + z.y) = zdr * z.x + zdr * z.y + zdi * z.x + zdi * z.y
+        // zd * z = (zdr * z.x - zdi * z.y) + (zdr * z.y + zdi * z.x)   
+        zd = vec2f(2. * (zd.x * z.x - zd.y * z.y) + 1., (2.0 + uniforms.t) * zd.x * z.y + 2.0 * zd.y * z.x); 
         z = vec2f(z.x * z.x - z.y * z.y, (2.0 + uniforms.t) * z.x * z.y) + c;
-        let mag2 = z.x * z.x + z.y * z.y;
+        let mag2 = mag2(z);
         if (mag2 > 64.0) {
             return (f32(i) - log2(log2(mag2)) + 4.0) / f32(uniforms.max_iter);
         }
     }
-    return 1.0;
+    return mag2(zd) * 0.1;
 }
 
 fn to_frame(uv: vec2f, offset: vec2f) -> vec2f {
