@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LLM Pangram Search</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+            background: #0d1117;
+            color: #c9d1d9;
+            line-height: 1.5;
+        }
+
+        .container {
+            max-width: 820px;
+            margin: 0 auto;
+            padding: 2rem 1rem;
+        }
+
+        h1 { color: #f0f6fc; font-size: 1.8rem; margin-bottom: 0.25rem; }
+        .subtitle { color: #8b949e; margin-bottom: 1.5rem; }
+
+        .panel {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 1rem 1.25rem;
+            margin-bottom: 1rem;
+        }
+
+        .panel h2 {
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.06em;
+            color: #8b949e;
+            margin-bottom: 0.75rem;
+        }
+
+        /* Tabs */
+        .tabs {
+            display: flex;
+            border-bottom: 1px solid #30363d;
+            margin-bottom: 1rem;
+        }
+
+        .tab {
+            padding: 0.5rem 1rem;
+            cursor: pointer;
+            border: none;
+            background: none;
+            color: #8b949e;
+            font-size: 0.9rem;
+            border-bottom: 2px solid transparent;
+            transition: all 0.15s;
+        }
+
+        .tab:hover { color: #c9d1d9; }
+        .tab.active { color: #f0f6fc; border-bottom-color: #58a6ff; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+
+        /* Forms */
+        .form-row {
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+            margin-bottom: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .form-row label {
+            min-width: 90px;
+            font-size: 0.85rem;
+            color: #8b949e;
+        }
+
+        input, select {
+            background: #0d1117;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            color: #c9d1d9;
+            padding: 0.4rem 0.6rem;
+            font-size: 0.85rem;
+            flex: 1;
+            min-width: 0;
+        }
+
+        input:focus, select:focus { outline: none; border-color: #58a6ff; }
+        input[type="number"] { max-width: 80px; flex: none; }
+
+        /* Buttons */
+        .controls { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+
+        button {
+            padding: 0.5rem 1.25rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            cursor: pointer;
+            border: 1px solid #30363d;
+            transition: all 0.15s;
+        }
+
+        .btn-primary { background: #238636; border-color: #2ea043; color: #fff; }
+        .btn-primary:hover:not(:disabled) { background: #2ea043; }
+        .btn-danger { background: #da3633; border-color: #f85149; color: #fff; }
+        .btn-danger:hover:not(:disabled) { background: #b62324; }
+        .btn-secondary { background: #21262d; color: #c9d1d9; }
+        .btn-secondary:hover:not(:disabled) { background: #30363d; }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* Progress */
+        .progress-bar {
+            height: 6px;
+            background: #21262d;
+            border-radius: 3px;
+            overflow: hidden;
+            margin: 0.5rem 0;
+            display: none;
+        }
+
+        .progress-bar.active { display: block; }
+
+        .progress-fill {
+            height: 100%;
+            background: #58a6ff;
+            border-radius: 3px;
+            transition: width 0.3s;
+            width: 0%;
+        }
+
+        .progress-text {
+            font-size: 0.8rem;
+            color: #8b949e;
+            display: none;
+            word-break: break-word;
+        }
+
+        .progress-text.active { display: block; }
+
+        /* Alphabet strip */
+        .alphabet {
+            display: flex;
+            gap: 3px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .letter-box {
+            width: 28px;
+            height: 32px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            text-transform: uppercase;
+            background: #21262d;
+            color: #484f58;
+            transition: all 0.15s;
+        }
+
+        .letter-box.covered { background: #238636; color: #fff; }
+
+        /* Sentences */
+        .sentence-display {
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 1rem;
+            min-height: 1.5em;
+            word-wrap: break-word;
+        }
+
+        .sentence-display.current { color: #f0f6fc; }
+        .sentence-display.best { color: #3fb950; font-size: 1.1rem; }
+
+        .meta {
+            font-size: 0.8rem;
+            color: #8b949e;
+            margin-top: 0.25rem;
+        }
+
+        .no-result { color: #484f58; font-style: italic; }
+
+        /* Stats */
+        .stats { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+        .stat { font-size: 0.8rem; color: #8b949e; }
+        .stat strong { color: #c9d1d9; font-variant-numeric: tabular-nums; }
+
+        /* Tree */
+        .tree-container {
+            max-height: 420px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.78rem;
+            line-height: 1.6;
+        }
+
+        .tree-node { padding-left: 1.2rem; border-left: 1px solid #21262d; }
+
+        .tree-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            padding: 1px 4px;
+            border-radius: 3px;
+        }
+
+        .tree-word { color: #c9d1d9; font-weight: 500; }
+        .tree-info { color: #484f58; font-size: 0.75rem; }
+        .tree-new { color: #58a6ff; font-size: 0.75rem; }
+
+        .tree-node.active > .tree-label { background: #1c3a5e; }
+        .tree-node.active > .tree-label .tree-word { color: #58a6ff; }
+        .tree-node.pangram > .tree-label { background: #1a3a2a; }
+        .tree-node.pangram > .tree-label .tree-word { color: #3fb950; }
+        .tree-node.pruned > .tree-label { opacity: 0.35; }
+        .tree-node.explored > .tree-label { opacity: 0.55; }
+        .tree-node.dead-end > .tree-label { opacity: 0.35; }
+        .tree-node.error > .tree-label { opacity: 0.35; color: #f85149; }
+
+        /* Log */
+        .log-entries {
+            max-height: 180px;
+            overflow-y: auto;
+            font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
+            font-size: 0.78rem;
+            line-height: 1.6;
+        }
+
+        .log-entry { padding: 1px 4px; border-radius: 3px; }
+        .log-entry.pangram { color: #3fb950; background: #1a3a2a; }
+        .log-entry.error { color: #f85149; }
+        .log-entry.info { color: #8b949e; }
+
+        /* Warning */
+        .warning {
+            background: #3d2e00;
+            border: 1px solid #d29922;
+            color: #d29922;
+            padding: 0.75rem 1rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            margin-bottom: 1rem;
+            display: none;
+        }
+
+        @media (max-width: 600px) {
+            .form-row { flex-direction: column; align-items: stretch; }
+            .form-row label { min-width: auto; }
+            input[type="number"] { max-width: none; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>LLM Pangram Search</h1>
+        <p class="subtitle">Depth-first search guided by a language model to find minimum-length pangrams</p>
+
+        <div id="webgpu-warning" class="warning">
+            WebGPU is not available in this browser. In-browser LLM requires WebGPU
+            (Chrome 113+, Edge 113+). You can still use the API tab.
+        </div>
+
+        <div class="panel">
+            <h2>LLM Backend</h2>
+            <div class="tabs">
+                <button class="tab active" data-tab="browser">In-Browser (WebGPU)</button>
+                <button class="tab" data-tab="api">Remote API</button>
+            </div>
+
+            <div id="tab-browser" class="tab-content active">
+                <div class="form-row">
+                    <label>Model</label>
+                    <select id="browser-model">
+                        <option value="SmolLM2-360M-Instruct-q4f16_1-MLC">SmolLM2-360M (fastest, ~250MB)</option>
+                        <option value="SmolLM2-1.7B-Instruct-q4f16_1-MLC">SmolLM2-1.7B (good, ~1GB)</option>
+                        <option value="Qwen2.5-0.5B-Instruct-q4f16_1-MLC">Qwen2.5-0.5B (~350MB)</option>
+                        <option value="Qwen2.5-1.5B-Instruct-q4f16_1-MLC" selected>Qwen2.5-1.5B (recommended, ~1GB)</option>
+                        <option value="Llama-3.2-1B-Instruct-q4f16_1-MLC">Llama-3.2-1B (~700MB)</option>
+                        <option value="Phi-3.5-mini-instruct-q4f16_1-MLC">Phi-3.5-mini (best, ~2.2GB)</option>
+                    </select>
+                </div>
+                <div style="margin-top: 0.5rem;">
+                    <button id="load-model-btn" class="btn-secondary">Load Model</button>
+                </div>
+                <div id="load-progress" class="progress-bar">
+                    <div id="load-progress-fill" class="progress-fill"></div>
+                </div>
+                <div id="load-progress-text" class="progress-text"></div>
+            </div>
+
+            <div id="tab-api" class="tab-content">
+                <div class="form-row">
+                    <label>Preset</label>
+                    <select id="api-preset">
+                        <option value="">Custom</option>
+                        <option value="openai">OpenAI</option>
+                        <option value="groq">Groq</option>
+                        <option value="together">Together AI</option>
+                    </select>
+                </div>
+                <div class="form-row">
+                    <label>Endpoint</label>
+                    <input id="api-url" type="text" placeholder="https://api.openai.com/v1/chat/completions">
+                </div>
+                <div class="form-row">
+                    <label>API Key</label>
+                    <input id="api-key" type="password" placeholder="sk-...">
+                </div>
+                <div class="form-row">
+                    <label>Model</label>
+                    <input id="api-model" type="text" placeholder="gpt-4o-mini">
+                </div>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Search Parameters</h2>
+            <div class="form-row">
+                <label>Branching</label>
+                <input id="branching" type="number" value="5" min="2" max="15">
+                <label>Max words</label>
+                <input id="max-depth" type="number" value="12" min="3" max="25">
+                <label>Temperature</label>
+                <input id="temperature" type="number" value="1.0" min="0" max="2" step="0.1">
+            </div>
+        </div>
+
+        <div class="controls">
+            <button id="start-btn" class="btn-primary">Start Search</button>
+            <button id="stop-btn" class="btn-danger" disabled>Stop</button>
+        </div>
+
+        <div class="panel">
+            <h2>Letter Coverage</h2>
+            <div id="alphabet" class="alphabet"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Current Path</h2>
+            <div id="current-sentence" class="sentence-display current">
+                <span class="no-result">Not started</span>
+            </div>
+            <div id="current-meta" class="meta"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Best Pangram</h2>
+            <div id="best-sentence" class="sentence-display best">
+                <span class="no-result">None found yet</span>
+            </div>
+            <div id="best-meta" class="meta"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Statistics</h2>
+            <div class="stats">
+                <span class="stat">Nodes: <strong id="stat-nodes">0</strong></span>
+                <span class="stat">LLM calls: <strong id="stat-api">0</strong></span>
+                <span class="stat">Cache hits: <strong id="stat-cache">0</strong></span>
+                <span class="stat">Pangrams: <strong id="stat-pangrams">0</strong></span>
+                <span class="stat">Elapsed: <strong id="stat-time">0s</strong></span>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Search Tree</h2>
+            <div id="tree" class="tree-container"></div>
+        </div>
+
+        <div class="panel">
+            <h2>Log</h2>
+            <div id="log" class="log-entries"></div>
+        </div>
+    </div>
+
+    <script type="module" src="main.js"></script>
+</body>
+</html>
