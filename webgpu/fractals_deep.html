@@ -1004,52 +1004,56 @@ void main(){
         // export holds the current vertical world span: pixelSize = 1/(zoom*H)
         const exPixelRaw = stepSubRaw(state.zoom, H, frac) * BigInt(SUBSCALE);
 
-        // content-aware safety cap (GPU-independent): bound sample-iterations/tile
+        // Adaptive quadtree: a DFS stack of rects is split until each leaf is
+        // <= the current leaf size, then rendered+measured. The leaf size GROWS
+        // when tiles render quickly and SHRINKS when slow -- so cheap regions get
+        // big tiles (fast) and expensive ones get small tiles (safe), without
+        // relying on a single up-front probe. The leaf is hard-capped by a
+        // GPU-independent content bound so no tile can overrun the watchdog.
         const aaSamp = 1 + EXPORT_AA * EXPORT_AA;
         const capPx = Math.max(32, Math.floor(Math.sqrt(
             SAFE_TILE_SAMPLE_ITERS / (aaSamp * state.maxIterations * (N * N / 9)))));
-        // Probe a center region at full export resolution to learn the GPU+content
-        // speed, then take the smaller of (probe-sized tile, safety cap).
+        const MAXLEAF = Math.min(512, capPx);   // offscreen is 1024; also <= content cap
+        const MINLEAF = 32, SAFE_MS = 700;      // shrink if a tile exceeds SAFE_MS
+        let leaf = Math.min(MAXLEAF, 96);       // start conservative, adapt from measurements
+        const buf = new Uint8Array(MAXLEAF * MAXLEAF * 4);
+
         btn.textContent = 'Export…'; await yieldFrame();
-        let tile = Math.min(capPx, 128);
         try {
-            const P = 64, pbuf = new Uint8Array(P * P * 4);
-            const t0 = performance.now();
-            uploadGeneric(ectx, mode, N, frac, cx, cy, state.zoom, state.t,
-                P, P, H, EXPORT_AA, state.maxIterations, state.colorScheme);
-            eg.readPixels(0, 0, P, P, eg.RGBA, eg.UNSIGNED_BYTE, pbuf);
-            const perPx = Math.max(1e-5, (performance.now() - t0) / (P * P));
-            const probeTile = Math.floor(Math.sqrt(TILE_BUDGET_MS / perPx));
-            tile = Math.max(32, Math.min(capPx, probeTile));
-        } catch (e) { /* keep capped fallback tile */ }
-
-        const tilesX = Math.ceil(W / tile), tilesY = Math.ceil(H / tile);
-        const total = tilesX * tilesY;
-        const buf = new Uint8Array(tile * tile * 4);
-        const img = o2.createImageData(tile, tile);
-
-        try {
-            let done = 0;
-            for (let ty = 0; ty < tilesY; ty++) {
-                for (let tx = 0; tx < tilesX; tx++, done++) {
-                    if (lost) throw new Error('WebGL context lost (job too large for the GPU). Try a smaller size or lower AA/iterations.');
-                    const cxPix = (tx * tile + tile / 2) - W / 2;
-                    const cyPix = -((ty * tile + tile / 2) - H / 2);
-                    const tcx = cx + BigInt(Math.round(cxPix)) * exPixelRaw;
-                    const tcy = cy + BigInt(Math.round(cyPix)) * exPixelRaw;
-
-                    uploadGeneric(ectx, mode, N, frac, tcx, tcy, state.zoom, state.t,
-                        tile, tile, H, EXPORT_AA, state.maxIterations, state.colorScheme);
-                    eg.readPixels(0, 0, tile, tile, eg.RGBA, eg.UNSIGNED_BYTE, buf);
-
-                    for (let row = 0; row < tile; row++) {  // WebGL is bottom-up: flip rows
-                        const src = (tile - 1 - row) * tile * 4;
-                        img.data.set(buf.subarray(src, src + tile * 4), row * tile * 4);
-                    }
-                    o2.putImageData(img, tx * tile, ty * tile);
-
-                    btn.textContent = `Export ${Math.round(100 * (done + 1) / total)}%`;
-                    await yieldFrame();                // keep page responsive + reset GPU watchdog
+            const stack = [{ x: 0, y: 0, w: W, h: H }];
+            const totalPx = W * H; let donePx = 0, frameStart = performance.now();
+            while (stack.length) {
+                if (lost) throw new Error('WebGL context lost (job too heavy for the GPU). Reduce size, AA or iterations.');
+                const r = stack.pop();
+                if (r.w > leaf || r.h > leaf) {     // subdivide into up to 4 quadrants
+                    const hw = Math.ceil(r.w / 2), hh = Math.ceil(r.h / 2);
+                    if (r.w > hw && r.h > hh) stack.push({ x: r.x + hw, y: r.y + hh, w: r.w - hw, h: r.h - hh });
+                    if (r.h > hh) stack.push({ x: r.x, y: r.y + hh, w: Math.min(hw, r.w), h: r.h - hh });
+                    if (r.w > hw) stack.push({ x: r.x + hw, y: r.y, w: r.w - hw, h: Math.min(hh, r.h) });
+                    stack.push({ x: r.x, y: r.y, w: Math.min(hw, r.w), h: Math.min(hh, r.h) });
+                    continue;
+                }
+                // render leaf r (its own pan; fixed-point makes tiles seamless)
+                const t0 = performance.now();
+                const cxPix = (r.x + r.w / 2) - W / 2, cyPix = -((r.y + r.h / 2) - H / 2);
+                const tcx = cx + BigInt(Math.round(cxPix)) * exPixelRaw;
+                const tcy = cy + BigInt(Math.round(cyPix)) * exPixelRaw;
+                uploadGeneric(ectx, mode, N, frac, tcx, tcy, state.zoom, state.t,
+                    r.w, r.h, H, EXPORT_AA, state.maxIterations, state.colorScheme);
+                eg.readPixels(0, 0, r.w, r.h, eg.RGBA, eg.UNSIGNED_BYTE, buf);
+                const img = o2.createImageData(r.w, r.h);
+                for (let row = 0; row < r.h; row++) {   // WebGL is bottom-up: flip rows
+                    const src = (r.h - 1 - row) * r.w * 4;
+                    img.data.set(buf.subarray(src, src + r.w * 4), row * r.w * 4);
+                }
+                o2.putImageData(img, r.x, r.y);
+                const ms = performance.now() - t0;
+                donePx += r.w * r.h;
+                if (ms < TILE_BUDGET_MS / 3) leaf = Math.min(MAXLEAF, leaf * 2);   // fast -> bigger tiles
+                else if (ms > SAFE_MS) leaf = Math.max(MINLEAF, leaf >> 1);        // slow -> smaller tiles
+                if (performance.now() - frameStart > 80) {   // yield to keep page alive
+                    btn.textContent = `Export ${Math.round(100 * donePx / totalPx)}%`;
+                    await yieldFrame(); frameStart = performance.now();
                 }
             }
             const link = document.createElement('a');
