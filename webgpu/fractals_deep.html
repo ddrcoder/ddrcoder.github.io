@@ -857,13 +857,27 @@ void main(){
         const label = btn.textContent;
         exporting = true; btn.disabled = true;
 
-        const N = state.N, frac = state.frac, mode = pickMode(state.zoom, H, state.aaRoot);
-        // Adaptive tile size: heavier precision -> smaller tiles, so no single
-        // GPU draw runs long enough to trip the browser's watchdog (TDR).
-        const tile = mode !== 'fixed' ? 1024 : N <= 2 ? 1024 : N <= 4 ? 512 : N <= 6 ? 384 : 256;
+        const EXPORT_AA = 6;            // always render export at high quality
+        // Per-tile time budget vs the ~2s GPU watchdog. Generous 4x margin since
+        // the probe samples one point and other tiles may be costlier.
+        const TILE_BUDGET_MS = 500;
 
+        // Precision for the export's AA level and output height (may exceed the
+        // on-screen precision); rescale the center into the export's frac.
+        const mode = pickMode(state.zoom, H, EXPORT_AA);
+        let N = state.N, frac = state.frac, cx = state.cx, cy = state.cy;
+        if (mode === 'fixed') {
+            N = requiredN(state.zoom, H, EXPORT_AA);
+            frac = 32 * (N - 1);
+            const d = frac - state.frac;
+            cx = d >= 0 ? state.cx << BigInt(d) : state.cx >> BigInt(-d);
+            cy = d >= 0 ? state.cy << BigInt(d) : state.cy >> BigInt(-d);
+        }
+
+        // Offscreen buffer is kept at 1024 and we render into a tile-sized
+        // bottom-left sub-rect, so the tile size can change without resizing.
         const off = document.createElement('canvas');
-        off.width = tile; off.height = tile;
+        off.width = 1024; off.height = 1024;
         const eg = off.getContext('webgl2', { preserveDrawingBuffer: false, antialias: false });
         if (!eg) { alert('export needs WebGL2'); exporting = false; btn.disabled = false; btn.textContent = label; return; }
 
@@ -878,6 +892,20 @@ void main(){
         // export holds the current vertical world span: pixelSize = 1/(zoom*H)
         const exPixelRaw = stepSubRaw(state.zoom, H, frac) * BigInt(SUBSCALE);
 
+        // Calibrate tile size: time a tiny probe at the real export settings,
+        // then choose the largest tile whose estimated cost fits the budget.
+        btn.textContent = 'Export…'; await yieldFrame();
+        let tile = 256;
+        try {
+            const P = 48, pbuf = new Uint8Array(P * P * 4);
+            const t0 = performance.now();
+            uploadGeneric(ectx, mode, N, frac, cx, cy, state.zoom, state.t,
+                P, P, H, EXPORT_AA, state.maxIterations, state.colorScheme);
+            eg.readPixels(0, 0, P, P, eg.RGBA, eg.UNSIGNED_BYTE, pbuf);
+            const perPx = Math.max(1e-5, (performance.now() - t0) / (P * P));
+            tile = Math.max(64, Math.min(1024, Math.floor(Math.sqrt(TILE_BUDGET_MS / perPx))));
+        } catch (e) { /* keep fallback tile */ }
+
         const tilesX = Math.ceil(W / tile), tilesY = Math.ceil(H / tile);
         const total = tilesX * tilesY;
         const buf = new Uint8Array(tile * tile * 4);
@@ -890,11 +918,11 @@ void main(){
                     if (lost) throw new Error('WebGL context lost (job too large for the GPU). Try a smaller size or lower AA/iterations.');
                     const cxPix = (tx * tile + tile / 2) - W / 2;
                     const cyPix = -((ty * tile + tile / 2) - H / 2);
-                    const tcx = state.cx + BigInt(Math.round(cxPix)) * exPixelRaw;
-                    const tcy = state.cy + BigInt(Math.round(cyPix)) * exPixelRaw;
+                    const tcx = cx + BigInt(Math.round(cxPix)) * exPixelRaw;
+                    const tcy = cy + BigInt(Math.round(cyPix)) * exPixelRaw;
 
                     uploadGeneric(ectx, mode, N, frac, tcx, tcy, state.zoom, state.t,
-                        tile, tile, H, Math.max(state.aaRoot, 2), state.maxIterations, state.colorScheme);
+                        tile, tile, H, EXPORT_AA, state.maxIterations, state.colorScheme);
                     eg.readPixels(0, 0, tile, tile, eg.RGBA, eg.UNSIGNED_BYTE, buf);
 
                     for (let row = 0; row < tile; row++) {  // WebGL is bottom-up: flip rows
