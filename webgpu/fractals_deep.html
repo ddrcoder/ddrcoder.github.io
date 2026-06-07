@@ -56,8 +56,9 @@
         </div>
         <div class="group">
             <label><input type="checkbox" id="auto-prec" checked> auto-precision</label>
-            <input type="range" id="prec-slider" min="2" max="16" step="1" value="2" disabled>
-            <span id="prec-value">2</span>
+            <input type="range" id="prec-slider" min="0" max="16" step="1" value="0" disabled
+                title="0=float32, 1=2xfloat32, 2+=fixed-point limbs">
+            <span id="prec-value" style="min-width:64px; display:inline-block;">float32</span>
         </div>
         <div class="group">
             <button id="reset-button">Reset view</button>
@@ -114,13 +115,16 @@
         const aaSamples = 1 + aaRoot * aaRoot;
         return Math.log2(Math.max(2, zoom * resY * aaSamples)) + PREC_GUARD_BITS;
     }
-    // pick the cheapest representation whose precision covers the sub-pixel step
+    // Auto mode picks float32 while it covers the sub-pixel step, else exact
+    // multi-limb fixed-point. Double-float is skipped in AUTO because its
+    // precision is unreliable across GPU drivers (the compiler can fold the
+    // error-compensation away); it remains available via the manual slider.
     function pickMode(zoom, resY, aaRoot) {
         const need = subPixelFracBits(zoom, resY, aaRoot) + PREC_MAG_BITS; // float is relative
-        if (need <= F32_MANTISSA) return 'f32';
-        if (need <= DF_MANTISSA) return 'df';
-        return 'fixed';
+        return need <= F32_MANTISSA ? 'f32' : 'fixed';
     }
+    // names for the manual precision slider: 0=f32, 1=df, k>=2 = k-limb fixed
+    function tierName(t) { return t === 0 ? 'float32' : t === 1 ? '2xfloat32' : t + ' limbs'; }
 
     const canvas = document.getElementById('glcanvas');
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
@@ -148,7 +152,7 @@
         maxIterations: 512,
         colorScheme: 0,
         autoPrec: true,
-        manualN: 2,
+        manualTier: 0,   // 0=f32, 1=df(2xf32), 2+=fixed-point limbs
         pixelRaw: 1n,          // fixed-point size of one screen pixel (filled at draw)
         // interaction
         isDragging: false, lastX: 0, lastY: 0,
@@ -294,10 +298,15 @@ out vec4 fragColor;
 ${SHADE}
 vec2 qts(float a, float b){ float s=a+b; float e=b-(s-a); return vec2(s,e); }
 vec2 ts(float a, float b){ float s=a+b; float bb=s-a; float e=(a-(s-bb))+(b-bb); return vec2(s,e); }
-vec2 tp(float a, float b){                 // two-product via Veltkamp split (no FMA)
+// Split a f32 into hi (top 12 mantissa bits) + lo via bit masking. A multiply
+// split written arithmetically (ah = c-(c-a)) gets folded back to 'a' by the
+// shader optimizer, which collapses double-float to float precision; masking
+// the mantissa bits is optimizer-proof.
+float dhi(float a){ return uintBitsToFloat(floatBitsToUint(a) & 0xfffff000u); }
+vec2 tp(float a, float b){                 // two-product (exact a*b as hi+lo)
     float p = a*b;
-    float ca=4097.0*a; float abig=ca-a; float ah=ca-abig; float al=a-ah;
-    float cb=4097.0*b; float bbig=cb-b; float bh=cb-bbig; float bl=b-bh;
+    float ah=dhi(a), al=a-ah;
+    float bh=dhi(b), bl=b-bh;
     float e=((ah*bh-p)+ah*bl+al*bh)+al*bl;
     return vec2(p,e);
 }
@@ -583,27 +592,37 @@ void main(){
     }
 
     function syncPrecision() {
-        const N = state.autoPrec ? requiredN(state.zoom, canvas.height, state.aaRoot) : state.manualN;
-        const clamped = Math.max(2, Math.min(MAX_LIMBS, N));
-        const newFrac = 32 * (clamped - 1);
+        // bits the center BigInt must store regardless of render mode
+        const autoN = requiredN(state.zoom, canvas.height, state.aaRoot);
+        let mode, N;
+        if (state.autoPrec) {
+            mode = pickMode(state.zoom, canvas.height, state.aaRoot);
+            N = autoN;
+        } else {
+            const tier = state.manualTier;
+            if (tier <= 1) { mode = tier === 0 ? 'f32' : 'df'; N = Math.max(2, autoN); }
+            else { mode = 'fixed'; N = tier; }
+        }
+        N = Math.max(2, Math.min(MAX_LIMBS, N));
+        const newFrac = 32 * (N - 1);
         if (newFrac !== state.frac) {
             const d = newFrac - state.frac;
             state.cx = d >= 0 ? state.cx << BigInt(d) : state.cx >> BigInt(-d);
             state.cy = d >= 0 ? state.cy << BigInt(d) : state.cy >> BigInt(-d);
             state.frac = newFrac;
         }
-        state.N = clamped;
-        // reflect auto value into the UI slider
+        state.N = N; state.mode = mode;
+        // reflect the auto-selected tier back into the slider
         if (state.autoPrec) {
-            document.getElementById('prec-slider').value = clamped;
-            document.getElementById('prec-value').textContent = clamped;
+            const tier = mode === 'f32' ? 0 : mode === 'df' ? 1 : N;
+            document.getElementById('prec-slider').value = tier;
+            document.getElementById('prec-value').textContent = tierName(tier);
         }
     }
 
     function draw(interactive, aaOverride) {
         if (contextLost) return;
         syncPrecision();
-        state.mode = pickMode(state.zoom, canvas.height, state.aaRoot);
         const aaRoot = interactive ? 0 : (aaOverride != null ? aaOverride : state.aaRoot);
         // pixel size for the input handlers (always the fixed-point pixel size)
         state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
@@ -828,8 +847,8 @@ void main(){
         drawScene();
     });
     document.getElementById('prec-slider').addEventListener('input', e => {
-        state.manualN = parseInt(e.target.value);
-        document.getElementById('prec-value').textContent = state.manualN;
+        state.manualTier = parseInt(e.target.value);
+        document.getElementById('prec-value').textContent = tierName(state.manualTier);
         if (!state.autoPrec) drawScene();
     });
     document.getElementById('reset-button').addEventListener('click', () => {
