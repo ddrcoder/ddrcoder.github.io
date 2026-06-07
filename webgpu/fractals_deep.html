@@ -98,11 +98,29 @@
     // browser GPU process, so we reduce (or skip) the AA pass to stay under it.
     const AA_BUDGET_MS = 1000;
     const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
-    // Hybrid precision tiers, chosen by zoom depth (conservative so the switch
-    // is visually seamless): float32 -> double-float -> multi-limb fixed-point.
-    const FLOAT_MAX = 2e3;         // f32 (~24-bit) is clean below this zoom
-    const DF_MAX = 1e10;           // double-float (~46-bit) is clean below this
-    function pickMode(zoom) { return zoom <= FLOAT_MAX ? 'f32' : zoom <= DF_MAX ? 'df' : 'fixed'; }
+
+    // ---- Precision model -------------------------------------------------
+    // The representation is chosen from the size of the finest sample we must
+    // resolve: the AA sub-pixel step = 1 / (zoom * windowHeight * aaSamples).
+    // We need that many fractional bits (below the ~unit-magnitude coordinate),
+    // plus a guard for the smooth-iteration gradient and rounding.
+    const PREC_GUARD_BITS = 4;     // headroom below the sub-pixel step
+    const PREC_MAG_BITS = 2;       // coordinate magnitude headroom (|c|,|z| < ~4)
+    const F32_MANTISSA = 24;       // usable mantissa bits of float32
+    const DF_MANTISSA = 44;        // usable bits of a double-float (two float32)
+
+    // fractional bits needed to resolve the finest AA sub-pixel step
+    function subPixelFracBits(zoom, resY, aaRoot) {
+        const aaSamples = 1 + aaRoot * aaRoot;
+        return Math.log2(Math.max(2, zoom * resY * aaSamples)) + PREC_GUARD_BITS;
+    }
+    // pick the cheapest representation whose precision covers the sub-pixel step
+    function pickMode(zoom, resY, aaRoot) {
+        const need = subPixelFracBits(zoom, resY, aaRoot) + PREC_MAG_BITS; // float is relative
+        if (need <= F32_MANTISSA) return 'f32';
+        if (need <= DF_MANTISSA) return 'df';
+        return 'fixed';
+    }
 
     const canvas = document.getElementById('glcanvas');
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
@@ -199,10 +217,9 @@
         return num / den;
     }
 
-    function requiredN(zoom, resY) {
-        // enough fractional bits to resolve ~20 bits below a pixel (verified clean
-        // against a deterministic CPU reference; keeps limb count minimal for speed)
-        const need = Math.ceil(Math.log2(Math.max(2, zoom * resY))) + 20;
+    function requiredN(zoom, resY, aaRoot) {
+        // fixed-point precision is absolute: FRAC must cover the sub-pixel step
+        const need = subPixelFracBits(zoom, resY, aaRoot);
         const n = Math.ceil(need / 32) + 1;
         return Math.max(2, Math.min(MAX_LIMBS, n));
     }
@@ -566,7 +583,7 @@ void main(){
     }
 
     function syncPrecision() {
-        const N = state.autoPrec ? requiredN(state.zoom, canvas.height) : state.manualN;
+        const N = state.autoPrec ? requiredN(state.zoom, canvas.height, state.aaRoot) : state.manualN;
         const clamped = Math.max(2, Math.min(MAX_LIMBS, N));
         const newFrac = 32 * (clamped - 1);
         if (newFrac !== state.frac) {
@@ -586,7 +603,7 @@ void main(){
     function draw(interactive, aaOverride) {
         if (contextLost) return;
         syncPrecision();
-        state.mode = pickMode(state.zoom);
+        state.mode = pickMode(state.zoom, canvas.height, state.aaRoot);
         const aaRoot = interactive ? 0 : (aaOverride != null ? aaOverride : state.aaRoot);
         // pixel size for the input handlers (always the fixed-point pixel size)
         state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
@@ -683,22 +700,22 @@ void main(){
         if (p.has('x')) {
             // accept both new ('zoom','iter') and earlier ('z','i') param names
             state.zoom = parseFloat(p.get('zoom') || p.get('z')) || state.zoom;
-            // pick precision from the zoom depth (coords are precision-independent)
+            state.aaRoot = parseInt(p.get('aa')); if (isNaN(state.aaRoot)) state.aaRoot = 2;
+            // pick precision from the sub-pixel step (coords are precision-independent)
             const legacyF = parseInt(p.get('f'));               // very old URLs stored raw limbs @ frac
             const xs = p.get('x'), ys = p.get('y');
             const isRaw = !isNaN(legacyF) && !xs.includes('.');
-            state.frac = isRaw ? legacyF : 32 * (requiredN(state.zoom, window.innerHeight) - 1);
+            state.frac = isRaw ? legacyF : 32 * (requiredN(state.zoom, window.innerHeight, state.aaRoot) - 1);
             state.N = state.frac / 32 + 1;
             state.cx = isRaw ? BigInt(xs) : decToRaw(xs, state.frac);
             state.cy = isRaw ? BigInt(ys) : decToRaw(ys, state.frac);
             state.t = parseFloat(p.get('t')) || 0;
-            state.aaRoot = parseInt(p.get('aa')); if (isNaN(state.aaRoot)) state.aaRoot = 2;
             const iterv = parseInt(p.get('iter') || p.get('i'));
             state.maxIterations = iterv || state.maxIterations;
             state.colorScheme = parseInt(p.get('cs')) || 0;
         } else {
             // default framing of the set
-            state.frac = 32 * (requiredN(state.zoom, window.innerHeight) - 1);
+            state.frac = 32 * (requiredN(state.zoom, window.innerHeight, state.aaRoot) - 1);
             state.cx = floatToRaw(-0.6, state.frac);
             state.cy = floatToRaw(0.0, state.frac);
         }
@@ -817,7 +834,7 @@ void main(){
     });
     document.getElementById('reset-button').addEventListener('click', () => {
         state.zoom = 0.38; state.t = 0;
-        state.frac = 32 * (requiredN(state.zoom, canvas.height) - 1);
+        state.frac = 32 * (requiredN(state.zoom, canvas.height, state.aaRoot) - 1);
         state.cx = floatToRaw(-0.6, state.frac);
         state.cy = floatToRaw(0.0, state.frac);
         document.getElementById('t-slider').value = 0;
@@ -840,7 +857,7 @@ void main(){
         const label = btn.textContent;
         exporting = true; btn.disabled = true;
 
-        const N = state.N, frac = state.frac, mode = pickMode(state.zoom);
+        const N = state.N, frac = state.frac, mode = pickMode(state.zoom, H, state.aaRoot);
         // Adaptive tile size: heavier precision -> smaller tiles, so no single
         // GPU draw runs long enough to trip the browser's watchdog (TDR).
         const tile = mode !== 'fixed' ? 1024 : N <= 2 ? 1024 : N <= 4 ? 512 : N <= 6 ? 384 : 256;
