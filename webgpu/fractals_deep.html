@@ -94,10 +94,6 @@
     const SUBSCALE = 256;          // sub-pixel grid for AA offsets (8 bits)
     const TILE_SIZE = 1024;        // export tile size
     const IDLE_INTERVAL = 250;     // ms before high-quality idle redraw
-    // The full-AA idle pass costs ~samples x the base (aa=0) pass. If that
-    // estimate exceeds this budget the GPU watchdog can trip and kill the whole
-    // browser GPU process, so we reduce (or skip) the AA pass to stay under it.
-    const AA_BUDGET_MS = 1000;
     const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
 
     // ---- Precision model -------------------------------------------------
@@ -680,22 +676,11 @@ void main(){
             } else {
                 state.lastRenderMs = performance.now() - startWall + probeMs;
                 state.lastRenderAA = aaRoot;
-                if (aaRoot === 0) state.baseMs = state.lastRenderMs;
                 updateReadout();
                 if (onDone) onDone();
             }
         }
         requestAnimationFrame(frame);
-    }
-
-    // Largest AA root whose estimated cost (~baseMs * samples) fits the budget.
-    function budgetedAARoot() {
-        const base = state.baseMs || 0;
-        if (state.aaRoot <= 0) return 0;
-        if (base <= 0) return state.aaRoot;
-        const maxSamples = AA_BUDGET_MS / base;
-        if (maxSamples < 2) return 0;
-        return Math.max(0, Math.min(state.aaRoot, Math.floor(Math.sqrt(maxSamples - 1))));
     }
 
     // ---- Coarse full-frame preview (during interaction) ------------------
@@ -767,8 +752,8 @@ void main(){
             pendingIdle = 0;
             if (gen !== renderGen) return;
             renderPass(gen, 0, () => {           // sharp full-res pass, then AA refine
-                const aa = budgetedAARoot();
-                if (aa > 0 && gen === renderGen) renderPass(gen, aa, null);
+                // tiling keeps every tile watchdog-safe, so always use full AA
+                if (state.aaRoot > 0 && gen === renderGen) renderPass(gen, state.aaRoot, null);
             });
         }, IDLE_INTERVAL);
     }
@@ -796,14 +781,10 @@ void main(){
         const modeStr = state.mode === 'f32' ? 'float32 (~24-bit)'
             : state.mode === 'df' ? 'double-float (~46-bit)'
             : `fixed ${state.N} limbs / ${fracBits} bits`;
-        // note when the AA pass was skipped/reduced to dodge the GPU watchdog
-        let aaNote = '';
-        if (state.aaRoot > 0 && appliedAA < state.aaRoot)
-            aaNote = appliedAA === 0 ? '  [AA skipped: too slow]' : `  [AA reduced ${state.aaRoot}->${appliedAA}]`;
         el.textContent =
             `zoom : 1e${depth.toFixed(2)}  (2^${Math.log2(state.zoom).toFixed(1)})\n` +
             `mode : ${modeStr}\n` +
-            `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)${aaNote}\n` +
+            `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)\n` +
             `cx   : ${rawToString(state.cx, state.frac)}\n` +
             `cy   : ${rawToString(state.cy, state.frac)}`;
     }
@@ -988,9 +969,11 @@ void main(){
         exporting = true; btn.disabled = true;
 
         const EXPORT_AA = 6;            // always render export at high quality
-        // Per-tile time budget vs the ~2s GPU watchdog. Generous 4x margin since
-        // the probe samples one point and other tiles may be costlier.
-        const TILE_BUDGET_MS = 500;
+        const TILE_BUDGET_MS = 200;    // GPU-time target per tile (probe-based)
+        // Hard cap on work per tile, independent of any probe: bounds
+        // sample-iterations so a single tile can't overrun the ~2s watchdog even
+        // if the probe underestimates (e.g. it landed on a fast-escaping point).
+        const SAFE_TILE_SAMPLE_ITERS = 2.5e8;
 
         // Export ALWAYS uses fixed-point: it is exact, so tiled output is
         // provably seamless (float/double-float tiles round each tile's local
@@ -1021,19 +1004,24 @@ void main(){
         // export holds the current vertical world span: pixelSize = 1/(zoom*H)
         const exPixelRaw = stepSubRaw(state.zoom, H, frac) * BigInt(SUBSCALE);
 
-        // Calibrate tile size: time a tiny probe at the real export settings,
-        // then choose the largest tile whose estimated cost fits the budget.
+        // content-aware safety cap (GPU-independent): bound sample-iterations/tile
+        const aaSamp = 1 + EXPORT_AA * EXPORT_AA;
+        const capPx = Math.max(32, Math.floor(Math.sqrt(
+            SAFE_TILE_SAMPLE_ITERS / (aaSamp * state.maxIterations * (N * N / 9)))));
+        // Probe a center region at full export resolution to learn the GPU+content
+        // speed, then take the smaller of (probe-sized tile, safety cap).
         btn.textContent = 'Export…'; await yieldFrame();
-        let tile = 256;
+        let tile = Math.min(capPx, 128);
         try {
-            const P = 48, pbuf = new Uint8Array(P * P * 4);
+            const P = 64, pbuf = new Uint8Array(P * P * 4);
             const t0 = performance.now();
             uploadGeneric(ectx, mode, N, frac, cx, cy, state.zoom, state.t,
                 P, P, H, EXPORT_AA, state.maxIterations, state.colorScheme);
             eg.readPixels(0, 0, P, P, eg.RGBA, eg.UNSIGNED_BYTE, pbuf);
             const perPx = Math.max(1e-5, (performance.now() - t0) / (P * P));
-            tile = Math.max(64, Math.min(1024, Math.floor(Math.sqrt(TILE_BUDGET_MS / perPx))));
-        } catch (e) { /* keep fallback tile */ }
+            const probeTile = Math.floor(Math.sqrt(TILE_BUDGET_MS / perPx));
+            tile = Math.max(32, Math.min(capPx, probeTile));
+        } catch (e) { /* keep capped fallback tile */ }
 
         const tilesX = Math.ceil(W / tile), tilesY = Math.ceil(H / tile);
         const total = tilesX * tilesY;
