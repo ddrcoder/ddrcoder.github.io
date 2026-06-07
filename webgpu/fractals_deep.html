@@ -127,7 +127,8 @@
     function tierName(t) { return t === 0 ? 'float32' : t === 1 ? '2xfloat32' : t + ' limbs'; }
 
     const canvas = document.getElementById('glcanvas');
-    const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+    // preserveDrawingBuffer so progressive tiles accumulate across rAF frames
+    const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: true });
     if (!gl) { alert('This page needs WebGL2.'); throw new Error('no webgl2'); }
 
     // If a single deep frame runs long enough to trip the GPU watchdog the
@@ -553,10 +554,13 @@ void main(){
     const syncPixel = new Uint8Array(4);   // scratch for readPixels-based GPU sync
 
     // ----------------------------------------------------------- rendering
-    // Unified uploader for all precision modes. `viewW/viewH` are the viewport
-    // (screen, or an export tile); `stepResY` is the FULL image height used to
-    // scale one pixel (canvas height on screen, export height when tiling).
-    function uploadGeneric(ctx, mode, N, frac, cx, cy, zoom, t, viewW, viewH, stepResY, aaRoot, maxIter, cs) {
+    // Unified uploader for all precision modes. `viewW/viewH` are the coordinate
+    // frame (full canvas/image); `stepResY` is the FULL image height used to
+    // scale one pixel. Optional vp* restrict the GL viewport to a sub-rect so a
+    // tile can be drawn while keeping the global frame (gl_FragCoord is absolute,
+    // so tiles are automatically seamless).
+    function uploadGeneric(ctx, mode, N, frac, cx, cy, zoom, t, viewW, viewH, stepResY, aaRoot, maxIter, cs,
+                           vpX, vpY, vpW, vpH) {
         const glx = ctx.gl;
         const { program, uni } = getProgram(ctx, mode, N);
         glx.useProgram(program);
@@ -586,7 +590,7 @@ void main(){
             glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
         }
 
-        glx.viewport(0, 0, viewW, viewH);
+        glx.viewport(vpX || 0, vpY || 0, vpW || viewW, vpH || viewH);
         // no clear: the fullscreen quad writes every pixel, so clearing first
         // only risks a visible black flash on slow deep-zoom frames.
         glx.drawArrays(glx.TRIANGLES, 0, 6);
@@ -621,52 +625,95 @@ void main(){
         }
     }
 
-    function draw(interactive, aaOverride) {
-        if (contextLost) return;
-        syncPrecision();
-        const aaRoot = interactive ? 0 : (aaOverride != null ? aaOverride : state.aaRoot);
-        // pixel size for the input handlers (always the fixed-point pixel size)
-        state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
-        const t0 = performance.now();
+    // ---- Progressive tiled rendering -------------------------------------
+    // The whole canvas is drawn as tiles across animation frames so no single
+    // drawArrays can run long enough to trip the GPU watchdog (which crashes
+    // the browser's GPU process). Tiles use the full-canvas coordinate frame
+    // (gl_FragCoord is absolute), so they are automatically seamless.
+    const TILE_TARGET_MS = 120;    // aim for one tile ~this long (<< ~2s watchdog)
+    const FRAME_TARGET_MS = 100;   // GPU work issued per frame, then synced to pace
+    let renderGen = 0;             // bump to cancel an in-flight progressive render
+    let pendingIdle = 0;
+
+    function renderTileVP(aaRoot, vx, vy, vw, vh) {
         uploadGeneric(mainCtx, state.mode, state.N, state.frac, state.cx, state.cy,
             state.zoom, state.t, canvas.width, canvas.height, canvas.height,
-            aaRoot, state.maxIterations, state.colorScheme);
-        // gl.finish() returns early in some browsers (GL runs in a separate
-        // process), under-reporting time. A 1x1 readPixels must block until the
-        // frame is actually rendered, so it yields a real wall-clock time.
-        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);
-        const ms = performance.now() - t0;
-        state.lastRenderMs = ms;
-        state.lastRenderAA = aaRoot;
-        if (interactive) state.baseMs = ms;      // cost of the cheap aa=0 pass
-        updateReadout();
-        updateURL();
+            aaRoot, state.maxIterations, state.colorScheme, vx, vy, vw, vh);
     }
 
-    // Largest AA root whose estimated full-pass cost (~baseMs * samples) fits the
-    // watchdog budget. Returns 0 to mean "skip the AA pass entirely".
+    function renderPass(gen, aaRoot, onDone) {
+        const W = canvas.width, H = canvas.height;
+        if (!W || !H || contextLost) return;
+        const aaSamples = 1 + aaRoot * aaRoot;
+
+        // cost probe at the center (usually the slowest, max-iteration region)
+        const PB = Math.min(48, W, H);
+        const t0 = performance.now();
+        renderTileVP(aaRoot, (W - PB) >> 1, (H - PB) >> 1, PB, PB);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);   // sync
+        const probeMs = performance.now() - t0;
+        if (gen !== renderGen) return;
+        const perSample = Math.max(1e-7, probeMs / (PB * PB * aaSamples));
+
+        let T = Math.floor(Math.sqrt(TILE_TARGET_MS / (aaSamples * perSample)));
+        T = Math.max(64, Math.min(1024, T));
+        const tilesX = Math.ceil(W / T), tilesY = Math.ceil(H / T), total = tilesX * tilesY;
+        let idx = 0;
+        let perFrame = Math.max(1, Math.round(FRAME_TARGET_MS / Math.max(1, T * T * aaSamples * perSample)));
+        const startWall = performance.now();
+
+        function frame() {
+            if (gen !== renderGen || contextLost) return;
+            const fStart = performance.now();
+            let n = 0;
+            while (idx < total && n < perFrame) {
+                const tx = idx % tilesX, ty = (idx / tilesX) | 0;
+                const vx = tx * T, vy = ty * T;
+                renderTileVP(aaRoot, vx, vy, Math.min(T, W - vx), Math.min(T, H - vy));
+                idx++; n++;
+            }
+            gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);  // pace + bound the queue
+            const frameMs = performance.now() - fStart;
+            perFrame = Math.max(1, Math.round(perFrame * FRAME_TARGET_MS / Math.max(1, frameMs)));
+            if (idx < total) {
+                requestAnimationFrame(frame);
+            } else {
+                state.lastRenderMs = performance.now() - startWall + probeMs;
+                state.lastRenderAA = aaRoot;
+                if (aaRoot === 0) state.baseMs = state.lastRenderMs;
+                updateReadout();
+                if (onDone) onDone();
+            }
+        }
+        requestAnimationFrame(frame);
+    }
+
+    // Largest AA root whose estimated cost (~baseMs * samples) fits the budget.
     function budgetedAARoot() {
         const base = state.baseMs || 0;
-        if (state.aaRoot <= 0) return 0;                  // user wants no AA anyway
-        if (base <= 0) return state.aaRoot;               // no estimate yet
+        if (state.aaRoot <= 0) return 0;
+        if (base <= 0) return state.aaRoot;
         const maxSamples = AA_BUDGET_MS / base;
-        if (maxSamples < 2) return 0;                     // can't afford even 2x -> skip
-        const r = Math.floor(Math.sqrt(maxSamples - 1));
-        return Math.max(0, Math.min(state.aaRoot, r));
+        if (maxSamples < 2) return 0;
+        return Math.max(0, Math.min(state.aaRoot, Math.floor(Math.sqrt(maxSamples - 1))));
     }
 
-    // idle high-quality redraw
-    let idleId = 0;
-    function queueIdleDraw() {
-        if (idleId) clearTimeout(idleId);
-        const r = budgetedAARoot();
-        if (r <= 0) {                                     // AA pass would risk the watchdog
-            updateReadout();                              // reflect "AA skipped" (last pass was aa=0)
-            return;
-        }
-        idleId = setTimeout(() => { idleId = 0; draw(false, r); }, IDLE_INTERVAL);
+    function drawScene() {
+        if (contextLost) return;
+        syncPrecision();
+        state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
+        updateURL();
+        const gen = ++renderGen;                 // cancels any in-flight render
+        if (pendingIdle) { clearTimeout(pendingIdle); pendingIdle = 0; }
+        renderPass(gen, 0, () => {               // quick aa=0 pass first
+            const aa = budgetedAARoot();         // then refine with AA when idle
+            if (aa <= 0) { updateReadout(); return; }
+            pendingIdle = setTimeout(() => {
+                pendingIdle = 0;
+                if (gen === renderGen) renderPass(gen, aa, null);
+            }, IDLE_INTERVAL);
+        });
     }
-    function drawScene() { draw(true); queueIdleDraw(); }
 
     // --------------------------------------------------------- readout/URL
     function rawToString(raw, frac) {
