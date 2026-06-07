@@ -698,21 +698,79 @@ void main(){
         return Math.max(0, Math.min(state.aaRoot, Math.floor(Math.sqrt(maxSamples - 1))));
     }
 
+    // ---- Coarse full-frame preview (during interaction) ------------------
+    // One small synchronous render into an offscreen FBO, then blit-upscaled to
+    // the canvas. A center-cost probe sizes the low resolution so the render
+    // stays ~COARSE_BUDGET_MS regardless of zoom depth (crisp when cheap, coarse
+    // when expensive) -- so it can never run long enough to trip the watchdog.
+    const COARSE_BUDGET_MS = 80;
+    let fbo = null, fboTex = null, fboW = 0, fboH = 0;
+    function ensureFBO(W, H) {
+        if (fbo && fboW === W && fboH === H) return;
+        if (fboTex) gl.deleteTexture(fboTex);
+        if (fbo) gl.deleteFramebuffer(fbo);
+        fboTex = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, fboTex);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, W, H, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+        gl.bindTexture(gl.TEXTURE_2D, null);
+        fbo = gl.createFramebuffer();
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        fboW = W; fboH = H;
+    }
+    function renderCoarse() {
+        const W = canvas.width, H = canvas.height;
+        if (!W || !H || contextLost) return;
+        ensureFBO(W, H);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+        // probe: a tiny full-view render measures this view's average per-pixel
+        // cost; the coarse render is the same view, so its time ~= budget.
+        const PB = 32, t0 = performance.now();
+        renderInto(0, PB, PB, 0, 0, PB, PB);
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);   // sync (FBO bound)
+        const per = Math.max(1e-7, (performance.now() - t0) / (PB * PB));
+        const budgetPx = Math.min(W * H, Math.max(256, COARSE_BUDGET_MS / per));
+        const s = Math.max(1, Math.sqrt((W * H) / budgetPx));
+        const lowW = Math.max(8, Math.round(W / s)), lowH = Math.max(8, Math.round(H / s));
+        renderInto(0, lowW, lowH, 0, 0, lowW, lowH);
+        gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+        // upscale the low-res render to fill the canvas
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, fbo);
+        gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
+        gl.blitFramebuffer(0, 0, lowW, lowH, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.LINEAR);
+        gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
+        state.perSampleMs = per;
+        state.lastRenderMs = performance.now() - t0; state.lastRenderAA = 0;
+        updateReadout();
+    }
+    // render the current view at (resW x resH) coordinate frame into the bound
+    // framebuffer's (vx,vy,vw,vh) viewport, at the given AA root.
+    function renderInto(aaRoot, resW, resH, vx, vy, vw, vh) {
+        uploadGeneric(mainCtx, state.mode, state.N, state.frac, state.cx, state.cy,
+            state.zoom, state.t, resW, resH, resH, aaRoot, state.maxIterations, state.colorScheme,
+            vx, vy, vw, vh);
+    }
+
     function drawScene() {
         if (contextLost) return;
         syncPrecision();
         state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
         updateURL();
-        const gen = ++renderGen;                 // cancels any in-flight render
-        if (pendingIdle) { clearTimeout(pendingIdle); pendingIdle = 0; }
-        renderPass(gen, 0, () => {               // quick aa=0 pass first
-            const aa = budgetedAARoot();         // then refine with AA when idle
-            if (aa <= 0) { updateReadout(); return; }
-            pendingIdle = setTimeout(() => {
-                pendingIdle = 0;
-                if (gen === renderGen) renderPass(gen, aa, null);
-            }, IDLE_INTERVAL);
-        });
+        const gen = ++renderGen;                 // cancels any in-flight tiled infill
+        renderCoarse();                          // immediate full-frame coarse preview
+        // full-resolution tiled infill once interaction settles
+        if (pendingIdle) clearTimeout(pendingIdle);
+        pendingIdle = setTimeout(() => {
+            pendingIdle = 0;
+            if (gen !== renderGen) return;
+            renderPass(gen, 0, () => {           // sharp full-res pass, then AA refine
+                const aa = budgetedAARoot();
+                if (aa > 0 && gen === renderGen) renderPass(gen, aa, null);
+            });
+        }, IDLE_INTERVAL);
     }
 
     // --------------------------------------------------------- readout/URL
