@@ -93,6 +93,10 @@
     const SUBSCALE = 256;          // sub-pixel grid for AA offsets (8 bits)
     const TILE_SIZE = 1024;        // export tile size
     const IDLE_INTERVAL = 250;     // ms before high-quality idle redraw
+    // The full-AA idle pass costs ~samples x the base (aa=0) pass. If that
+    // estimate exceeds this budget the GPU watchdog can trip and kill the whole
+    // browser GPU process, so we reduce (or skip) the AA pass to stay under it.
+    const AA_BUDGET_MS = 1000;
     const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
     // Hybrid precision tiers, chosen by zoom depth (conservative so the switch
     // is visually seamless): float32 -> double-float -> multi-limb fixed-point.
@@ -579,11 +583,11 @@ void main(){
         }
     }
 
-    function draw(interactive) {
+    function draw(interactive, aaOverride) {
         if (contextLost) return;
         syncPrecision();
         state.mode = pickMode(state.zoom);
-        const aaRoot = interactive ? 0 : state.aaRoot;
+        const aaRoot = interactive ? 0 : (aaOverride != null ? aaOverride : state.aaRoot);
         // pixel size for the input handlers (always the fixed-point pixel size)
         state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
         const t0 = performance.now();
@@ -594,17 +598,36 @@ void main(){
         // process), under-reporting time. A 1x1 readPixels must block until the
         // frame is actually rendered, so it yields a real wall-clock time.
         gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);
-        state.lastRenderMs = performance.now() - t0;
+        const ms = performance.now() - t0;
+        state.lastRenderMs = ms;
         state.lastRenderAA = aaRoot;
+        if (interactive) state.baseMs = ms;      // cost of the cheap aa=0 pass
         updateReadout();
         updateURL();
+    }
+
+    // Largest AA root whose estimated full-pass cost (~baseMs * samples) fits the
+    // watchdog budget. Returns 0 to mean "skip the AA pass entirely".
+    function budgetedAARoot() {
+        const base = state.baseMs || 0;
+        if (state.aaRoot <= 0) return 0;                  // user wants no AA anyway
+        if (base <= 0) return state.aaRoot;               // no estimate yet
+        const maxSamples = AA_BUDGET_MS / base;
+        if (maxSamples < 2) return 0;                     // can't afford even 2x -> skip
+        const r = Math.floor(Math.sqrt(maxSamples - 1));
+        return Math.max(0, Math.min(state.aaRoot, r));
     }
 
     // idle high-quality redraw
     let idleId = 0;
     function queueIdleDraw() {
         if (idleId) clearTimeout(idleId);
-        idleId = setTimeout(() => { idleId = 0; draw(false); }, IDLE_INTERVAL);
+        const r = budgetedAARoot();
+        if (r <= 0) {                                     // AA pass would risk the watchdog
+            updateReadout();                              // reflect "AA skipped" (last pass was aa=0)
+            return;
+        }
+        idleId = setTimeout(() => { idleId = 0; draw(false, r); }, IDLE_INTERVAL);
     }
     function drawScene() { draw(true); queueIdleDraw(); }
 
@@ -626,14 +649,19 @@ void main(){
         const depth = Math.log10(state.zoom);
         const fracBits = state.frac;
         const ms = state.lastRenderMs || 0;
-        const samples = 1 + (state.lastRenderAA || 0) * (state.lastRenderAA || 0);
+        const appliedAA = state.lastRenderAA || 0;
+        const samples = 1 + appliedAA * appliedAA;
         const modeStr = state.mode === 'f32' ? 'float32 (~24-bit)'
             : state.mode === 'df' ? 'double-float (~46-bit)'
             : `fixed ${state.N} limbs / ${fracBits} bits`;
+        // note when the AA pass was skipped/reduced to dodge the GPU watchdog
+        let aaNote = '';
+        if (state.aaRoot > 0 && appliedAA < state.aaRoot)
+            aaNote = appliedAA === 0 ? '  [AA skipped: too slow]' : `  [AA reduced ${state.aaRoot}->${appliedAA}]`;
         el.textContent =
             `zoom : 1e${depth.toFixed(2)}  (2^${Math.log2(state.zoom).toFixed(1)})\n` +
             `mode : ${modeStr}\n` +
-            `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)\n` +
+            `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)${aaNote}\n` +
             `cx   : ${rawToString(state.cx, state.frac)}\n` +
             `cy   : ${rawToString(state.cy, state.frac)}`;
     }
