@@ -94,6 +94,11 @@
     const TILE_SIZE = 1024;        // export tile size
     const IDLE_INTERVAL = 250;     // ms before high-quality idle redraw
     const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
+    // Hybrid precision tiers, chosen by zoom depth (conservative so the switch
+    // is visually seamless): float32 -> double-float -> multi-limb fixed-point.
+    const FLOAT_MAX = 2e3;         // f32 (~24-bit) is clean below this zoom
+    const DF_MAX = 1e10;           // double-float (~46-bit) is clean below this
+    function pickMode(zoom) { return zoom <= FLOAT_MAX ? 'f32' : zoom <= DF_MAX ? 'df' : 'fixed'; }
 
     const canvas = document.getElementById('glcanvas');
     const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
@@ -148,6 +153,21 @@
         return neg ? -raw : raw;
     }
 
+    // fixed-point BigInt -> JS double (best-effort, keeps top ~52 bits)
+    function rawToNum(raw, frac) {
+        const neg = raw < 0n; let v = neg ? -raw : raw;
+        let f = frac;
+        if (f > 52) { v >>= BigInt(f - 52); f = 52; }
+        const num = Number(v) / Math.pow(2, f);
+        return neg ? -num : num;
+    }
+    // split a double into a double-float pair of float32s (hi, lo)
+    function toDFparts(value) {
+        const hi = Math.fround(value);
+        const lo = Math.fround(value - hi);
+        return [hi, lo];
+    }
+
     function toLimbs(raw, N) {
         const M = 1n << BigInt(32 * N);
         let u = ((raw % M) + M) % M;          // two's complement wrap
@@ -188,7 +208,112 @@
 layout(location=0) in vec2 a_position;
 void main(){ gl_Position = vec4(a_position, 0.0, 1.0); }`;
 
-    function fragSrc(N) {
+    // shared smooth-iteration coloring
+    const SHADE = `
+vec3 shade(float mu, float fdot, int maxit, int scheme){
+    if (mu < float(maxit)) mu -= log2(log2(fdot)) + 4.0;
+    float tcol = mu / float(maxit);
+    if (scheme == 1) return vec3(clamp(tcol*3.0,0.0,1.0), clamp(tcol*3.0-1.0,0.0,1.0), clamp(tcol*3.0-2.0,0.0,1.0));
+    return vec3(clamp(tcol*3.0-2.0,0.0,1.0), clamp(tcol*3.0-1.0,0.0,1.0), clamp(tcol*3.0,0.0,1.0));
+}`;
+
+    // Tier 0: plain float32 (~24-bit). Fast; matches the original shader's reach.
+    function fragSrcF32() {
+        return `#version 300 es
+precision highp float;
+uniform vec2 u_resolution;
+uniform vec2 u_pan;        // center (float)
+uniform float u_step;      // world units per screen pixel = 1/(zoom*resY)
+uniform float u_t;
+uniform int u_aa_root;
+uniform int u_max_iter;
+uniform int u_color_scheme;
+out vec4 fragColor;
+${SHADE}
+void main(){
+    vec3 color = vec3(0.0);
+    int aa_max = 1 + u_aa_root*u_aa_root;
+    float aa_dx = float(u_aa_root)/float(aa_max);
+    float aa_dy = 1.0/float(aa_max);
+    float fac = 2.0 + u_t;
+    for (int aa=0; aa<64; aa++){
+        if (aa >= aa_max) break;
+        float ox = float(aa)*aa_dx - float(int(float(aa)*aa_dx));
+        float oy = float(aa)*aa_dy;
+        vec2 c = (gl_FragCoord.xy + vec2(ox,oy) - u_resolution*0.5) * u_step + u_pan;
+        vec2 z = vec2(0.0);
+        float mu = float(u_max_iter); float fdot = 4.0;
+        for (int it=0; it<2048; it++){
+            if (it >= u_max_iter) break;
+            float xx = z.x*z.x, yy = z.y*z.y;
+            float d = xx + yy;
+            if (d > 4.0){ mu = float(it); fdot = d; break; }
+            float xy = z.x*z.y;
+            z = vec2(xx - yy + c.x, fac*xy + c.y);
+        }
+        color += shade(mu, fdot, u_max_iter, u_color_scheme);
+    }
+    fragColor = vec4(color/float(aa_max), 1.0);
+}`;
+    }
+
+    // Tier 1: double-float (two float32 ~ 46-bit mantissa, Thall/Dekker style).
+    function fragSrcDF() {
+        return `#version 300 es
+precision highp float;
+uniform vec2 u_resolution;
+uniform vec2 u_panx;       // df center x (hi, lo)
+uniform vec2 u_pany;       // df center y
+uniform vec2 u_step;       // df world units per screen pixel
+uniform float u_t;
+uniform int u_aa_root;
+uniform int u_max_iter;
+uniform int u_color_scheme;
+out vec4 fragColor;
+${SHADE}
+vec2 qts(float a, float b){ float s=a+b; float e=b-(s-a); return vec2(s,e); }
+vec2 ts(float a, float b){ float s=a+b; float bb=s-a; float e=(a-(s-bb))+(b-bb); return vec2(s,e); }
+vec2 tp(float a, float b){                 // two-product via Veltkamp split (no FMA)
+    float p = a*b;
+    float ca=4097.0*a; float abig=ca-a; float ah=ca-abig; float al=a-ah;
+    float cb=4097.0*b; float bbig=cb-b; float bh=cb-bbig; float bl=b-bh;
+    float e=((ah*bh-p)+ah*bl+al*bh)+al*bl;
+    return vec2(p,e);
+}
+vec2 dadd(vec2 a, vec2 b){ vec2 s=ts(a.x,b.x); vec2 t=ts(a.y,b.y); s.y+=t.x; s=qts(s.x,s.y); s.y+=t.y; return qts(s.x,s.y); }
+vec2 dmul(vec2 a, vec2 b){ vec2 p=tp(a.x,b.x); p.y+=a.x*b.y+a.y*b.x; return qts(p.x,p.y); }
+vec2 dneg(vec2 a){ return vec2(-a.x,-a.y); }
+void main(){
+    vec3 color = vec3(0.0);
+    int aa_max = 1 + u_aa_root*u_aa_root;
+    float aa_dx = float(u_aa_root)/float(aa_max);
+    float aa_dy = 1.0/float(aa_max);
+    vec2 fac = dadd(vec2(2.0,0.0), vec2(u_t,0.0));
+    for (int aa=0; aa<64; aa++){
+        if (aa >= aa_max) break;
+        float ox = float(aa)*aa_dx - float(int(float(aa)*aa_dx));
+        float oy = float(aa)*aa_dy;
+        vec2 cx = dadd(u_panx, dmul(u_step, vec2(gl_FragCoord.x + ox - u_resolution.x*0.5, 0.0)));
+        vec2 cy = dadd(u_pany, dmul(u_step, vec2(gl_FragCoord.y + oy - u_resolution.y*0.5, 0.0)));
+        vec2 zx = vec2(0.0), zy = vec2(0.0);
+        float mu = float(u_max_iter); float fdot = 4.0;
+        for (int it=0; it<2048; it++){
+            if (it >= u_max_iter) break;
+            vec2 xx = dmul(zx,zx), yy = dmul(zy,zy);
+            float d = xx.x + yy.x;
+            if (d > 4.0){ mu = float(it); fdot = d; break; }
+            vec2 xy = dmul(zx,zy);
+            vec2 nx = dadd(dadd(xx, dneg(yy)), cx);
+            vec2 ny = dadd(dmul(fac, xy), cy);
+            zx = nx; zy = ny;
+        }
+        color += shade(mu, fdot, u_max_iter, u_color_scheme);
+    }
+    fragColor = vec4(color/float(aa_max), 1.0);
+}`;
+    }
+
+    function fragSrcFixed(N) {
         const DN = 2 * N;
         return `#version 300 es
 precision highp float;
@@ -357,19 +482,21 @@ void main(){
         }
         return sh;
     }
-    function buildProgram(glx, N) {
+    function buildProgram(glx, mode, N) {
+        const src = mode === 'f32' ? fragSrcF32() : mode === 'df' ? fragSrcDF() : fragSrcFixed(N);
         const p = glx.createProgram();
         glx.attachShader(p, compile(glx, glx.VERTEX_SHADER, VERT));
-        glx.attachShader(p, compile(glx, glx.FRAGMENT_SHADER, fragSrc(N)));
+        glx.attachShader(p, compile(glx, glx.FRAGMENT_SHADER, src));
         glx.linkProgram(p);
         if (!glx.getProgramParameter(p, glx.LINK_STATUS))
             throw new Error('link failed: ' + glx.getProgramInfoLog(p));
-        const loc = n => glx.getUniformLocation(p, n);
+        const loc = n => glx.getUniformLocation(p, n);   // null for uniforms absent in this mode
         return {
             program: p,
             uni: {
-                res: loc('u_resolution'), panx: loc('u_panx'), pany: loc('u_pany'),
-                step: loc('u_step'), factor: loc('u_factor'),
+                res: loc('u_resolution'), pan: loc('u_pan'),
+                panx: loc('u_panx'), pany: loc('u_pany'),
+                step: loc('u_step'), factor: loc('u_factor'), t: loc('u_t'),
                 aa: loc('u_aa_root'), maxIter: loc('u_max_iter'), cs: loc('u_color_scheme'),
             }
         };
@@ -385,37 +512,53 @@ void main(){
         glx.vertexAttribPointer(0, 2, glx.FLOAT, false, 0, 0);
         return { gl: glx, cache: new Map() };
     }
-    function getProgram(ctx, N) {
-        if (!ctx.cache.has(N)) ctx.cache.set(N, buildProgram(ctx.gl, N));
-        return ctx.cache.get(N);
+    function getProgram(ctx, mode, N) {
+        const key = mode === 'fixed' ? 'fix' + N : mode;
+        if (!ctx.cache.has(key)) ctx.cache.set(key, buildProgram(ctx.gl, mode, N));
+        return ctx.cache.get(key);
     }
 
     const mainCtx = makeContext(gl);
     const syncPixel = new Uint8Array(4);   // scratch for readPixels-based GPU sync
 
     // ----------------------------------------------------------- rendering
-    function uploadAndDraw(ctx, N, frac, cx, cy, zoom, t, resX, resY, aaRoot, maxIter, cs) {
+    // Unified uploader for all precision modes. `viewW/viewH` are the viewport
+    // (screen, or an export tile); `stepResY` is the FULL image height used to
+    // scale one pixel (canvas height on screen, export height when tiling).
+    function uploadGeneric(ctx, mode, N, frac, cx, cy, zoom, t, viewW, viewH, stepResY, aaRoot, maxIter, cs) {
         const glx = ctx.gl;
-        const { program, uni } = getProgram(ctx, N);
+        const { program, uni } = getProgram(ctx, mode, N);
         glx.useProgram(program);
 
-        const stepSub = stepSubRaw(zoom, resY, frac);
-        const factorRaw = floatToRaw(2.0 + t, frac);
-
-        glx.uniform2f(uni.res, resX, resY);
-        glx.uniform1uiv(uni.panx, toLimbs(cx, N));
-        glx.uniform1uiv(uni.pany, toLimbs(cy, N));
-        glx.uniform1uiv(uni.step, toLimbs(stepSub, N));
-        glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
+        glx.uniform2f(uni.res, viewW, viewH);
         glx.uniform1i(uni.aa, aaRoot);
         glx.uniform1i(uni.maxIter, maxIter);
         glx.uniform1i(uni.cs, cs);
 
-        glx.viewport(0, 0, resX, resY);
+        if (mode === 'f32') {
+            glx.uniform2f(uni.pan, rawToNum(cx, frac), rawToNum(cy, frac));
+            glx.uniform1f(uni.step, 1 / (zoom * stepResY));
+            glx.uniform1f(uni.t, t);
+        } else if (mode === 'df') {
+            const px = toDFparts(rawToNum(cx, frac)), py = toDFparts(rawToNum(cy, frac));
+            const st = toDFparts(1 / (zoom * stepResY));
+            glx.uniform2f(uni.panx, px[0], px[1]);
+            glx.uniform2f(uni.pany, py[0], py[1]);
+            glx.uniform2f(uni.step, st[0], st[1]);
+            glx.uniform1f(uni.t, t);
+        } else {
+            const stepSub = stepSubRaw(zoom, stepResY, frac);
+            const factorRaw = floatToRaw(2.0 + t, frac);
+            glx.uniform1uiv(uni.panx, toLimbs(cx, N));
+            glx.uniform1uiv(uni.pany, toLimbs(cy, N));
+            glx.uniform1uiv(uni.step, toLimbs(stepSub, N));
+            glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
+        }
+
+        glx.viewport(0, 0, viewW, viewH);
         // no clear: the fullscreen quad writes every pixel, so clearing first
         // only risks a visible black flash on slow deep-zoom frames.
         glx.drawArrays(glx.TRIANGLES, 0, 6);
-        return stepSub;
     }
 
     function syncPrecision() {
@@ -439,18 +582,20 @@ void main(){
     function draw(interactive) {
         if (contextLost) return;
         syncPrecision();
+        state.mode = pickMode(state.zoom);
         const aaRoot = interactive ? 0 : state.aaRoot;
+        // pixel size for the input handlers (always the fixed-point pixel size)
+        state.pixelRaw = stepSubRaw(state.zoom, canvas.height, state.frac) * BigInt(SUBSCALE);
         const t0 = performance.now();
-        const stepSub = uploadAndDraw(
-            mainCtx, state.N, state.frac, state.cx, state.cy, state.zoom, state.t,
-            canvas.width, canvas.height, aaRoot, state.maxIterations, state.colorScheme);
+        uploadGeneric(mainCtx, state.mode, state.N, state.frac, state.cx, state.cy,
+            state.zoom, state.t, canvas.width, canvas.height, canvas.height,
+            aaRoot, state.maxIterations, state.colorScheme);
         // gl.finish() returns early in some browsers (GL runs in a separate
         // process), under-reporting time. A 1x1 readPixels must block until the
         // frame is actually rendered, so it yields a real wall-clock time.
         gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);
         state.lastRenderMs = performance.now() - t0;
         state.lastRenderAA = aaRoot;
-        state.pixelRaw = stepSub * BigInt(SUBSCALE);
         updateReadout();
         updateURL();
     }
@@ -482,9 +627,12 @@ void main(){
         const fracBits = state.frac;
         const ms = state.lastRenderMs || 0;
         const samples = 1 + (state.lastRenderAA || 0) * (state.lastRenderAA || 0);
+        const modeStr = state.mode === 'f32' ? 'float32 (~24-bit)'
+            : state.mode === 'df' ? 'double-float (~46-bit)'
+            : `fixed ${state.N} limbs / ${fracBits} bits`;
         el.textContent =
             `zoom : 1e${depth.toFixed(2)}  (2^${Math.log2(state.zoom).toFixed(1)})\n` +
-            `prec : ${state.N} limbs / ${fracBits} frac bits\n` +
+            `mode : ${modeStr}\n` +
             `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)\n` +
             `cx   : ${rawToString(state.cx, state.frac)}\n` +
             `cy   : ${rawToString(state.cy, state.frac)}`;
@@ -664,10 +812,10 @@ void main(){
         const label = btn.textContent;
         exporting = true; btn.disabled = true;
 
-        const N = state.N, frac = state.frac;
+        const N = state.N, frac = state.frac, mode = pickMode(state.zoom);
         // Adaptive tile size: heavier precision -> smaller tiles, so no single
         // GPU draw runs long enough to trip the browser's watchdog (TDR).
-        const tile = N <= 2 ? 1024 : N <= 4 ? 512 : N <= 6 ? 384 : 256;
+        const tile = mode !== 'fixed' ? 1024 : N <= 2 ? 1024 : N <= 4 ? 512 : N <= 6 ? 384 : 256;
 
         const off = document.createElement('canvas');
         off.width = tile; off.height = tile;
@@ -700,9 +848,8 @@ void main(){
                     const tcx = state.cx + BigInt(Math.round(cxPix)) * exPixelRaw;
                     const tcy = state.cy + BigInt(Math.round(cyPix)) * exPixelRaw;
 
-                    uploadAndDrawExport(ectx, N, frac, tcx, tcy, state.zoom, state.t, H, tile,
-                        Math.max(state.aaRoot, 2), state.maxIterations, state.colorScheme);
-                    eg.finish();                       // make sure the tile is done before readback
+                    uploadGeneric(ectx, mode, N, frac, tcx, tcy, state.zoom, state.t,
+                        tile, tile, H, Math.max(state.aaRoot, 2), state.maxIterations, state.colorScheme);
                     eg.readPixels(0, 0, tile, tile, eg.RGBA, eg.UNSIGNED_BYTE, buf);
 
                     for (let row = 0; row < tile; row++) {  // WebGL is bottom-up: flip rows
@@ -727,26 +874,6 @@ void main(){
             exporting = false; btn.disabled = false; btn.textContent = label;
         }
     }
-    // export draws into a `tile`-sized viewport; u_resolution is the tile size,
-    // pan is the tile center, step is the export step (resolution H).
-    function uploadAndDrawExport(ctx, N, frac, cx, cy, zoom, t, H, tile, aaRoot, maxIter, cs) {
-        const glx = ctx.gl;
-        const { program, uni } = getProgram(ctx, N);
-        glx.useProgram(program);
-        const stepSub = stepSubRaw(zoom, H, frac);
-        const factorRaw = floatToRaw(2.0 + t, frac);
-        glx.uniform2f(uni.res, tile, tile);
-        glx.uniform1uiv(uni.panx, toLimbs(cx, N));
-        glx.uniform1uiv(uni.pany, toLimbs(cy, N));
-        glx.uniform1uiv(uni.step, toLimbs(stepSub, N));
-        glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
-        glx.uniform1i(uni.aa, aaRoot);
-        glx.uniform1i(uni.maxIter, maxIter);
-        glx.uniform1i(uni.cs, cs);
-        glx.viewport(0, 0, tile, tile);
-        glx.drawArrays(glx.TRIANGLES, 0, 6);
-    }
-
     // --------------------------------------------------------------- boot
     initFromURL();
     resizeCanvas();
