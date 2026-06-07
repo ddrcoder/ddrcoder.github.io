@@ -887,17 +887,16 @@ void main(){
         // the probe samples one point and other tiles may be costlier.
         const TILE_BUDGET_MS = 500;
 
-        // Precision for the export's AA level and output height (may exceed the
-        // on-screen precision); rescale the center into the export's frac.
-        const mode = pickMode(state.zoom, H, EXPORT_AA);
-        let N = state.N, frac = state.frac, cx = state.cx, cy = state.cy;
-        if (mode === 'fixed') {
-            N = requiredN(state.zoom, H, EXPORT_AA);
-            frac = 32 * (N - 1);
-            const d = frac - state.frac;
-            cx = d >= 0 ? state.cx << BigInt(d) : state.cx >> BigInt(-d);
-            cy = d >= 0 ? state.cy << BigInt(d) : state.cy >> BigInt(-d);
-        }
+        // Export ALWAYS uses fixed-point: it is exact, so tiled output is
+        // provably seamless (float/double-float tiles round each tile's local
+        // pan independently, producing sub-pixel seams at tile boundaries).
+        // Precision is sized for the export's AA level and output height.
+        const mode = 'fixed';
+        const N = requiredN(state.zoom, H, EXPORT_AA);
+        const frac = 32 * (N - 1);
+        const d = frac - state.frac;
+        const cx = d >= 0 ? state.cx << BigInt(d) : state.cx >> BigInt(-d);
+        const cy = d >= 0 ? state.cy << BigInt(d) : state.cy >> BigInt(-d);
 
         // Offscreen buffer is kept at 1024 and we render into a tile-sized
         // bottom-left sub-rect, so the tile size can change without resizing.
