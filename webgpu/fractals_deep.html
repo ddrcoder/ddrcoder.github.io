@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+    <title>Deep Fractal (WebGL2 fixed-point)</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #000; }
+        canvas { display: block; }
+        #toolbar {
+            position: absolute; top: 0; left: 0; width: 100%;
+            padding: 8px 10px; box-sizing: border-box;
+            background-color: rgba(0, 0, 0, 0.35);
+            z-index: 1000; color: #fff;
+            font-family: Helvetica, Arial, sans-serif; font-size: 13px;
+            display: flex; align-items: center; flex-wrap: wrap; gap: 10px;
+        }
+        #toolbar label { white-space: nowrap; }
+        #toolbar input[type=range] { vertical-align: middle; }
+        .group { display: flex; align-items: center; gap: 6px; }
+        #readout {
+            position: absolute; left: 8px; bottom: 8px; z-index: 1000;
+            color: #9fe; font-family: ui-monospace, Menlo, Consolas, monospace;
+            font-size: 12px; background: rgba(0,0,0,0.4); padding: 6px 8px;
+            border-radius: 4px; white-space: pre; line-height: 1.4;
+            pointer-events: none;
+        }
+        button { cursor: pointer; }
+    </style>
+</head>
+
+<body>
+    <div id="toolbar">
+        <div class="group">
+            <label for="color-scheme-select">Color</label>
+            <select id="color-scheme-select">
+                <option value="0">Ice</option>
+                <option value="1">Fire</option>
+            </select>
+        </div>
+        <div class="group" style="flex-grow:1; min-width:160px;">
+            <label for="t-slider">t</label>
+            <input type="range" id="t-slider" min="-1" max="1" step="0.0001" value="0" style="flex-grow:1;">
+            <span id="t-value">0</span>
+        </div>
+        <div class="group">
+            <label for="aa-slider">AA</label>
+            <input type="range" id="aa-slider" min="0" max="6" step="1" value="2">
+            <span id="aa-value">2</span>
+        </div>
+        <div class="group">
+            <label for="max-iterations-slider">Iter</label>
+            <input type="range" id="max-iterations-slider" min="64" max="2048" step="8" value="512">
+            <span id="max-iterations-value">512</span>
+        </div>
+        <div class="group">
+            <label><input type="checkbox" id="auto-prec" checked> auto-precision</label>
+            <input type="range" id="prec-slider" min="2" max="16" step="1" value="2" disabled>
+            <span id="prec-value">2</span>
+        </div>
+        <div class="group">
+            <button id="reset-button">Reset view</button>
+        </div>
+        <div class="group">
+            <input type="number" id="export-width" value="1920" min="1" step="1" style="width:64px;">
+            <span>x</span>
+            <input type="number" id="export-height" value="1080" min="1" step="1" style="width:64px;">
+            <button id="export-button">Export PNG</button>
+        </div>
+    </div>
+    <canvas id="glcanvas"></canvas>
+    <div id="readout"></div>
+
+    <script>
+    "use strict";
+    // =====================================================================
+    //  Deep-zoom Mandelbrot variant.
+    //
+    //  Numbers are fixed-point with N 32-bit limbs (little-endian), stored in
+    //  two's complement. The binary point sits so that:
+    //      value = rawInteger / 2^FRAC,   FRAC = 32 * (N - 1)
+    //  i.e. the top limb is the signed integer part, the lower N-1 limbs are
+    //  fractional. That makes multiply's rescale a pure whole-limb shift.
+    //
+    //  GPU does the per-pixel iteration in this format. GLSL ES 3.00 (WebGL2)
+    //  has native uint but NO umulExtended/uaddCarry, so the 32x32->64 multiply
+    //  and add-carry are synthesized from 16-bit halves (see mul32/addv). The
+    //  host keeps the view CENTER as full-precision BigInt so zoom depth isn't
+    //  capped by float64.
+    // =====================================================================
+
+    const SUBSCALE = 256;          // sub-pixel grid for AA offsets (8 bits)
+    const TILE_SIZE = 1024;        // export tile size
+    const IDLE_INTERVAL = 250;     // ms before high-quality idle redraw
+    const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
+
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl2', { antialias: false, preserveDrawingBuffer: false });
+    if (!gl) { alert('This page needs WebGL2.'); throw new Error('no webgl2'); }
+
+    // If a single deep frame runs long enough to trip the GPU watchdog the
+    // context is lost; surface it instead of dying silently.
+    let contextLost = false;
+    canvas.addEventListener('webglcontextlost', e => {
+        e.preventDefault(); contextLost = true;
+        const el = document.getElementById('readout');
+        if (el) el.textContent = 'GPU context lost — a frame was too heavy.\n' +
+            'Lower Iter / precision, then reload.';
+    });
+    canvas.addEventListener('webglcontextrestored', () => { contextLost = false; });
+
+    // ---------------------------------------------------------------- state
+    const state = {
+        cx: 0n, cy: 0n,        // center, fixed-point BigInt at scale 2^frac
+        frac: 32,              // current FRAC (== 32*(N-1))
+        N: 2,
+        zoom: 0.38,            // pixelSize = 1/(zoom*resY); larger = deeper
+        t: 0,
+        aaRoot: 2,
+        maxIterations: 512,
+        colorScheme: 0,
+        autoPrec: true,
+        manualN: 2,
+        pixelRaw: 1n,          // fixed-point size of one screen pixel (filled at draw)
+        // interaction
+        isDragging: false, lastX: 0, lastY: 0,
+    };
+
+    // ------------------------------------------------------ BigInt helpers
+    function floatToRaw(v, frac) {
+        // round(v * 2^frac) as BigInt, robust for large frac
+        const neg = v < 0; v = Math.abs(v);
+        const big = BigInt(Math.round(v * 9007199254740992)); // v * 2^53
+        const d = frac - 53;
+        let r = d >= 0 ? (big << BigInt(d)) : (big >> BigInt(-d));
+        return neg ? -r : r;
+    }
+
+    // exact decimal string -> fixed-point BigInt at 2^frac (precision-independent)
+    function decToRaw(str, frac) {
+        str = String(str).trim();
+        const neg = str[0] === '-'; if (neg) str = str.slice(1);
+        let [ip, fp = ''] = str.split('.');
+        const scale = 1n << BigInt(frac);
+        let raw = (ip === '' ? 0n : BigInt(ip)) * scale;
+        if (fp.length) raw += (BigInt(fp) * scale) / (10n ** BigInt(fp.length));
+        return neg ? -raw : raw;
+    }
+
+    function toLimbs(raw, N) {
+        const M = 1n << BigInt(32 * N);
+        let u = ((raw % M) + M) % M;          // two's complement wrap
+        const out = new Uint32Array(N);
+        const mask = 0xffffffffn;
+        for (let k = 0; k < N; k++) { out[k] = Number(u & mask); u >>= 32n; }
+        return out;
+    }
+
+    function bigMulFloat(raw, f) {            // raw * f, f a regular float
+        const S = 1n << 40n;
+        return (raw * BigInt(Math.round(f * Number(S)))) / S;
+    }
+
+    // step for ONE sub-unit:  round( 2^FRAC / (zoom * resY * SUBSCALE) )
+    function stepSubRaw(zoom, resY, frac) {
+        const z = zoom * resY * SUBSCALE;     // may be astronomically large
+        const e = Math.floor(Math.log2(z));
+        const m = z / Math.pow(2, e);         // mantissa in [1,2)
+        const P = 40;
+        const sh = frac - e + P;
+        if (sh < 0) return 1n;                // precision underflow (auto-prec avoids this)
+        const num = 1n << BigInt(sh);
+        const den = BigInt(Math.round(m * Math.pow(2, P)));
+        return num / den;
+    }
+
+    function requiredN(zoom, resY) {
+        // enough fractional bits to resolve ~20 bits below a pixel (verified clean
+        // against a deterministic CPU reference; keeps limb count minimal for speed)
+        const need = Math.ceil(Math.log2(Math.max(2, zoom * resY))) + 20;
+        const n = Math.ceil(need / 32) + 1;
+        return Math.max(2, Math.min(MAX_LIMBS, n));
+    }
+
+    // ------------------------------------------------------- GLSL builders
+    const VERT = `#version 300 es
+layout(location=0) in vec2 a_position;
+void main(){ gl_Position = vec4(a_position, 0.0, 1.0); }`;
+
+    function fragSrc(N) {
+        const DN = 2 * N;
+        return `#version 300 es
+precision highp float;
+precision highp int;
+#define N ${N}
+#define DN ${DN}
+const float SUBSCALE = ${SUBSCALE}.0;
+
+uniform vec2 u_resolution;
+uniform uint u_panx[N];
+uniform uint u_pany[N];
+uniform uint u_step[N];      // size of one sub-unit, fixed-point (positive)
+uniform uint u_factor[N];    // (2.0 + t), fixed-point (positive)
+uniform int  u_aa_root;
+uniform int  u_max_iter;
+uniform int  u_color_scheme;
+out vec4 fragColor;
+
+bool isNeg(uint a[N]){ return (a[N-1] & 0x80000000u) != 0u; }
+
+// 32x32 -> 64 widening multiply, synthesized from 16-bit halves
+// (GLSL ES 3.00 / WebGL2 has no umulExtended).
+void mul32(uint a, uint b, out uint hi, out uint lo){
+    uint a0 = a & 0xFFFFu, a1 = a >> 16;
+    uint b0 = b & 0xFFFFu, b1 = b >> 16;
+    uint ll = a0*b0, lh = a0*b1, hl = a1*b0, hh = a1*b1;
+    uint mid = (ll >> 16) + (lh & 0xFFFFu) + (hl & 0xFFFFu);
+    lo = (ll & 0xFFFFu) | (mid << 16);
+    hi = hh + (lh >> 16) + (hl >> 16) + (mid >> 16);
+}
+void negate(inout uint a[N]){
+    uint carry = 1u;
+    for (int k=0;k<N;k++){ uint x = ~a[k]; uint s = x + carry; carry = (s < x) ? 1u : 0u; a[k] = s; }
+}
+void addv(uint a[N], uint b[N], out uint r[N]){
+    uint carry = 0u;
+    for (int k=0;k<N;k++){
+        uint s1 = a[k] + b[k]; uint c1 = (s1 < a[k]) ? 1u : 0u;
+        uint s2 = s1 + carry;  uint c2 = (s2 < s1)   ? 1u : 0u;
+        r[k] = s2; carry = c1 + c2;
+    }
+}
+void subv(uint a[N], uint b[N], out uint r[N]){    // a - b = a + ~b + 1
+    uint carry = 1u;
+    for (int k=0;k<N;k++){
+        uint nb = ~b[k];
+        uint s1 = a[k] + nb;   uint c1 = (s1 < a[k]) ? 1u : 0u;
+        uint s2 = s1 + carry;  uint c2 = (s2 < s1)   ? 1u : 0u;
+        r[k] = s2; carry = c1 + c2;
+    }
+}
+void mulmag(uint a[N], uint b[N], out uint r[N]){  // unsigned schoolbook
+    uint p[DN];
+    for (int k=0;k<DN;k++) p[k] = 0u;
+    for (int i=0;i<N;i++){
+        uint carry = 0u;                            // full 32-bit running carry
+        for (int j=0;j<N;j++){
+            uint hi, lo; mul32(a[i], b[j], hi, lo);
+            uint s1 = lo + p[i+j]; uint c1 = (s1 < lo) ? 1u : 0u;
+            uint s2 = s1 + carry;  uint c2 = (s2 < s1) ? 1u : 0u;
+            p[i+j] = s2;
+            carry = hi + c1 + c2;                    // provably < 2^32
+        }
+        uint c = carry;
+        for (int idx=i+N; idx<DN; idx++){
+            if (c == 0u) break;
+            uint s = p[idx] + c; uint cc = (s < p[idx]) ? 1u : 0u; p[idx] = s; c = cc;
+        }
+    }
+    // >> FRAC, FRAC = 32*(N-1)  =>  keep limbs starting at N-1
+    for (int k=0;k<N;k++) r[k] = p[k + N - 1];
+}
+void mul(uint a[N], uint b[N], out uint r[N]){
+    uint aa[N]; uint bb[N];
+    for (int k=0;k<N;k++){ aa[k]=a[k]; bb[k]=b[k]; }
+    bool sa = isNeg(aa); if (sa) negate(aa);
+    bool sb = isNeg(bb); if (sb) negate(bb);
+    mulmag(aa, bb, r);
+    if (sa != sb) negate(r);
+}
+void mul_int(uint a[N], int s, out uint r[N]){     // fixed-point * signed int
+    uint mag = uint(abs(s));
+    uint carry = 0u;
+    for (int k=0;k<N;k++){
+        uint hi, lo; mul32(a[k], mag, hi, lo);
+        uint s1 = lo + carry; uint c1 = (s1 < lo) ? 1u : 0u;
+        r[k] = s1; carry = hi + c1;
+    }
+    if (s < 0) negate(r);
+}
+
+void main(){
+    vec3 color = vec3(0.0);
+    int aa_max = 1 + u_aa_root * u_aa_root;
+    float aa_dx = float(u_aa_root) / float(aa_max);
+    float aa_dy = 1.0 / float(aa_max);
+    float px = gl_FragCoord.x - u_resolution.x * 0.5;
+    float py = gl_FragCoord.y - u_resolution.y * 0.5;
+
+    for (int aa=0; aa<64; aa++){
+        if (aa >= aa_max) break;
+        float ox = float(aa) * aa_dx - float(int(float(aa) * aa_dx));
+        float oy = float(aa) * aa_dy;
+        int ix = int(floor((px + ox) * SUBSCALE + 0.5));
+        int iy = int(floor((py + oy) * SUBSCALE + 0.5));
+
+        uint dx[N]; mul_int(u_step, ix, dx);
+        uint dy[N]; mul_int(u_step, iy, dy);
+        uint cx[N]; addv(u_panx, dx, cx);
+        uint cy[N]; addv(u_pany, dy, cy);
+
+        uint zx[N]; uint zy[N];
+        for (int k=0;k<N;k++){ zx[k]=0u; zy[k]=0u; }
+
+        float mu = float(u_max_iter);
+        float fdot = 4.0;
+        for (int it=0; it<2048; it++){
+            if (it >= u_max_iter) break;
+            uint xx[N]; mul(zx, zx, xx);
+            uint yy[N]; mul(zy, zy, yy);
+            uint sum[N]; addv(xx, yy, sum);
+            int ip = int(sum[N-1]);                 // integer part of |z|^2
+            if (ip >= 4){
+                mu = float(it);
+                fdot = float(sum[N-1]) + float(sum[N-2]) * (1.0 / 4294967296.0);
+                break;
+            }
+            uint xy[N];  mul(zx, zy, xy);
+            uint nx[N];  subv(xx, yy, nx); addv(nx, cx, nx);     // x' = x^2 - y^2 + cx
+            uint fxy[N]; mul(u_factor, xy, fxy);
+            uint ny[N];  addv(fxy, cy, ny);                       // y' = (2+t)xy + cy
+            for (int k=0;k<N;k++){ zx[k]=nx[k]; zy[k]=ny[k]; }
+        }
+
+        if (mu < float(u_max_iter)){
+            mu -= log2(log2(fdot)) + 4.0;           // smooth iteration count
+        }
+        float tcol = mu / float(u_max_iter);
+
+        vec3 tap;
+        if (u_color_scheme == 1){
+            tap = vec3(clamp(tcol*3.0,       0.0,1.0),
+                       clamp(tcol*3.0 - 1.0, 0.0,1.0),
+                       clamp(tcol*3.0 - 2.0, 0.0,1.0));
+        } else {
+            tap = vec3(clamp(tcol*3.0 - 2.0, 0.0,1.0),
+                       clamp(tcol*3.0 - 1.0, 0.0,1.0),
+                       clamp(tcol*3.0,       0.0,1.0));
+        }
+        color += tap;
+    }
+    color /= float(aa_max);
+    fragColor = vec4(color, 1.0);
+}`;
+    }
+
+    // ---------------------------------------------------- program plumbing
+    function compile(glx, type, src) {
+        const sh = glx.createShader(type);
+        glx.shaderSource(sh, src);
+        glx.compileShader(sh);
+        if (!glx.getShaderParameter(sh, glx.COMPILE_STATUS)) {
+            const log = glx.getShaderInfoLog(sh);
+            console.error(log, src);
+            throw new Error('shader compile failed: ' + log);
+        }
+        return sh;
+    }
+    function buildProgram(glx, N) {
+        const p = glx.createProgram();
+        glx.attachShader(p, compile(glx, glx.VERTEX_SHADER, VERT));
+        glx.attachShader(p, compile(glx, glx.FRAGMENT_SHADER, fragSrc(N)));
+        glx.linkProgram(p);
+        if (!glx.getProgramParameter(p, glx.LINK_STATUS))
+            throw new Error('link failed: ' + glx.getProgramInfoLog(p));
+        const loc = n => glx.getUniformLocation(p, n);
+        return {
+            program: p,
+            uni: {
+                res: loc('u_resolution'), panx: loc('u_panx'), pany: loc('u_pany'),
+                step: loc('u_step'), factor: loc('u_factor'),
+                aa: loc('u_aa_root'), maxIter: loc('u_max_iter'), cs: loc('u_color_scheme'),
+            }
+        };
+    }
+    function makeContext(glx) {
+        // fullscreen quad on attribute location 0 (shared across programs)
+        const buf = glx.createBuffer();
+        glx.bindBuffer(glx.ARRAY_BUFFER, buf);
+        glx.bufferData(glx.ARRAY_BUFFER, new Float32Array([
+            -1,-1, 1,-1, -1,1, -1,1, 1,-1, 1,1
+        ]), glx.STATIC_DRAW);
+        glx.enableVertexAttribArray(0);
+        glx.vertexAttribPointer(0, 2, glx.FLOAT, false, 0, 0);
+        return { gl: glx, cache: new Map() };
+    }
+    function getProgram(ctx, N) {
+        if (!ctx.cache.has(N)) ctx.cache.set(N, buildProgram(ctx.gl, N));
+        return ctx.cache.get(N);
+    }
+
+    const mainCtx = makeContext(gl);
+    const syncPixel = new Uint8Array(4);   // scratch for readPixels-based GPU sync
+
+    // ----------------------------------------------------------- rendering
+    function uploadAndDraw(ctx, N, frac, cx, cy, zoom, t, resX, resY, aaRoot, maxIter, cs) {
+        const glx = ctx.gl;
+        const { program, uni } = getProgram(ctx, N);
+        glx.useProgram(program);
+
+        const stepSub = stepSubRaw(zoom, resY, frac);
+        const factorRaw = floatToRaw(2.0 + t, frac);
+
+        glx.uniform2f(uni.res, resX, resY);
+        glx.uniform1uiv(uni.panx, toLimbs(cx, N));
+        glx.uniform1uiv(uni.pany, toLimbs(cy, N));
+        glx.uniform1uiv(uni.step, toLimbs(stepSub, N));
+        glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
+        glx.uniform1i(uni.aa, aaRoot);
+        glx.uniform1i(uni.maxIter, maxIter);
+        glx.uniform1i(uni.cs, cs);
+
+        glx.viewport(0, 0, resX, resY);
+        // no clear: the fullscreen quad writes every pixel, so clearing first
+        // only risks a visible black flash on slow deep-zoom frames.
+        glx.drawArrays(glx.TRIANGLES, 0, 6);
+        return stepSub;
+    }
+
+    function syncPrecision() {
+        const N = state.autoPrec ? requiredN(state.zoom, canvas.height) : state.manualN;
+        const clamped = Math.max(2, Math.min(MAX_LIMBS, N));
+        const newFrac = 32 * (clamped - 1);
+        if (newFrac !== state.frac) {
+            const d = newFrac - state.frac;
+            state.cx = d >= 0 ? state.cx << BigInt(d) : state.cx >> BigInt(-d);
+            state.cy = d >= 0 ? state.cy << BigInt(d) : state.cy >> BigInt(-d);
+            state.frac = newFrac;
+        }
+        state.N = clamped;
+        // reflect auto value into the UI slider
+        if (state.autoPrec) {
+            document.getElementById('prec-slider').value = clamped;
+            document.getElementById('prec-value').textContent = clamped;
+        }
+    }
+
+    function draw(interactive) {
+        if (contextLost) return;
+        syncPrecision();
+        const aaRoot = interactive ? 0 : state.aaRoot;
+        const t0 = performance.now();
+        const stepSub = uploadAndDraw(
+            mainCtx, state.N, state.frac, state.cx, state.cy, state.zoom, state.t,
+            canvas.width, canvas.height, aaRoot, state.maxIterations, state.colorScheme);
+        // gl.finish() returns early in some browsers (GL runs in a separate
+        // process), under-reporting time. A 1x1 readPixels must block until the
+        // frame is actually rendered, so it yields a real wall-clock time.
+        gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);
+        state.lastRenderMs = performance.now() - t0;
+        state.lastRenderAA = aaRoot;
+        state.pixelRaw = stepSub * BigInt(SUBSCALE);
+        updateReadout();
+        updateURL();
+    }
+
+    // idle high-quality redraw
+    let idleId = 0;
+    function queueIdleDraw() {
+        if (idleId) clearTimeout(idleId);
+        idleId = setTimeout(() => { idleId = 0; draw(false); }, IDLE_INTERVAL);
+    }
+    function drawScene() { draw(true); queueIdleDraw(); }
+
+    // --------------------------------------------------------- readout/URL
+    function rawToString(raw, frac) {
+        // exact decimal of a fixed-point BigInt, enough digits to round-trip at this frac
+        const neg = raw < 0n; let v = neg ? -raw : raw;
+        const one = 1n << BigInt(frac);
+        const ip = v / one;
+        let fp = v % one;
+        const digits = Math.ceil(frac * 0.30103) + 2; // ~log10(2^frac), no cap
+        let s = '';
+        for (let i = 0; i < digits; i++) { fp *= 10n; s += (fp / one).toString(); fp %= one; }
+        s = s.replace(/0+$/, '');
+        return (neg ? '-' : '') + ip.toString() + (s ? '.' + s : '');
+    }
+    function updateReadout() {
+        const el = document.getElementById('readout');
+        const depth = Math.log10(state.zoom);
+        const fracBits = state.frac;
+        const ms = state.lastRenderMs || 0;
+        const samples = 1 + (state.lastRenderAA || 0) * (state.lastRenderAA || 0);
+        el.textContent =
+            `zoom : 1e${depth.toFixed(2)}  (2^${Math.log2(state.zoom).toFixed(1)})\n` +
+            `prec : ${state.N} limbs / ${fracBits} frac bits\n` +
+            `time : ${ms.toFixed(1)} ms  (${samples}x sample, ${(1000 / Math.max(ms, 0.01)).toFixed(0)} fps)\n` +
+            `cx   : ${rawToString(state.cx, state.frac)}\n` +
+            `cy   : ${rawToString(state.cy, state.frac)}`;
+    }
+    let urlTimer = 0;
+    function updateURL() {
+        if (urlTimer) return;
+        urlTimer = setTimeout(() => {
+            urlTimer = 0;
+            // store the actual decimal coordinate -> precision-independent
+            const x = rawToString(state.cx, state.frac);
+            const y = rawToString(state.cy, state.frac);
+            const f = `#x=${x}&y=${y}&zoom=${state.zoom}` +
+                      `&t=${state.t}&aa=${state.aaRoot}&iter=${state.maxIterations}&cs=${state.colorScheme}`;
+            history.replaceState(null, '', f);
+        }, 120);
+    }
+    function initFromURL() {
+        const p = new URLSearchParams(location.hash.slice(1));
+        if (p.has('x')) {
+            // accept both new ('zoom','iter') and earlier ('z','i') param names
+            state.zoom = parseFloat(p.get('zoom') || p.get('z')) || state.zoom;
+            // pick precision from the zoom depth (coords are precision-independent)
+            const legacyF = parseInt(p.get('f'));               // very old URLs stored raw limbs @ frac
+            const xs = p.get('x'), ys = p.get('y');
+            const isRaw = !isNaN(legacyF) && !xs.includes('.');
+            state.frac = isRaw ? legacyF : 32 * (requiredN(state.zoom, window.innerHeight) - 1);
+            state.N = state.frac / 32 + 1;
+            state.cx = isRaw ? BigInt(xs) : decToRaw(xs, state.frac);
+            state.cy = isRaw ? BigInt(ys) : decToRaw(ys, state.frac);
+            state.t = parseFloat(p.get('t')) || 0;
+            state.aaRoot = parseInt(p.get('aa')); if (isNaN(state.aaRoot)) state.aaRoot = 2;
+            const iterv = parseInt(p.get('iter') || p.get('i'));
+            state.maxIterations = iterv || state.maxIterations;
+            state.colorScheme = parseInt(p.get('cs')) || 0;
+        } else {
+            // default framing of the set
+            state.frac = 32 * (requiredN(state.zoom, window.innerHeight) - 1);
+            state.cx = floatToRaw(-0.6, state.frac);
+            state.cy = floatToRaw(0.0, state.frac);
+        }
+        // sync UI
+        document.getElementById('t-slider').value = state.t;
+        document.getElementById('t-value').textContent = state.t.toFixed(4);
+        document.getElementById('aa-slider').value = state.aaRoot;
+        document.getElementById('aa-value').textContent = state.aaRoot;
+        document.getElementById('max-iterations-slider').value = state.maxIterations;
+        document.getElementById('max-iterations-value').textContent = state.maxIterations;
+        document.getElementById('color-scheme-select').value = state.colorScheme;
+    }
+
+    // ------------------------------------------------------------- resize
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+    }
+    window.addEventListener('resize', () => { resizeCanvas(); drawScene(); });
+
+    // -------------------------------------------------------- interaction
+    canvas.addEventListener('mousedown', e => {
+        state.isDragging = true; state.lastX = e.clientX; state.lastY = e.clientY;
+    });
+    canvas.addEventListener('mousemove', e => {
+        if (!state.isDragging) return;
+        const dx = e.clientX - state.lastX, dy = e.clientY - state.lastY;
+        state.cx -= BigInt(Math.round(dx)) * state.pixelRaw;
+        state.cy += BigInt(Math.round(dy)) * state.pixelRaw;
+        state.lastX = e.clientX; state.lastY = e.clientY;
+        drawScene();
+    });
+    window.addEventListener('mouseup', () => state.isDragging = false);
+
+    function zoomAt(px, py, zf) {
+        const ox = px - canvas.width * 0.5;
+        const oy = -(py - canvas.height * 0.5);
+        const f = 1 - 1 / zf;
+        state.cx += bigMulFloat(BigInt(Math.round(ox)) * state.pixelRaw, f);
+        state.cy += bigMulFloat(BigInt(Math.round(oy)) * state.pixelRaw, f);
+        state.zoom *= zf;
+        drawScene();
+    }
+    canvas.addEventListener('wheel', e => {
+        e.preventDefault();
+        zoomAt(e.clientX, e.clientY, Math.exp(e.deltaY * -0.001));
+    }, { passive: false });
+
+    // touch: drag + pinch
+    let lastDist = 0, lastMidX = 0, lastMidY = 0;
+    canvas.addEventListener('touchstart', e => {
+        if (e.touches.length === 1) {
+            state.isDragging = true;
+            state.lastX = e.touches[0].clientX; state.lastY = e.touches[0].clientY;
+        } else if (e.touches.length === 2) {
+            state.isDragging = false;
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            lastDist = Math.hypot(dx, dy);
+            lastMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            lastMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+        }
+    }, { passive: false });
+    canvas.addEventListener('touchmove', e => {
+        e.preventDefault();
+        if (e.touches.length === 1 && state.isDragging) {
+            const dx = e.touches[0].clientX - state.lastX;
+            const dy = e.touches[0].clientY - state.lastY;
+            state.cx -= BigInt(Math.round(dx)) * state.pixelRaw;
+            state.cy += BigInt(Math.round(dy)) * state.pixelRaw;
+            state.lastX = e.touches[0].clientX; state.lastY = e.touches[0].clientY;
+            drawScene();
+        } else if (e.touches.length === 2) {
+            const dx = e.touches[0].clientX - e.touches[1].clientX;
+            const dy = e.touches[0].clientY - e.touches[1].clientY;
+            const dist = Math.hypot(dx, dy);
+            const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+            const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+            if (lastDist > 0) zoomAt(midX, midY, dist / lastDist);
+            lastDist = dist; lastMidX = midX; lastMidY = midY;
+        }
+    }, { passive: false });
+    canvas.addEventListener('touchend', e => {
+        if (e.touches.length < 2) lastDist = 0;
+        if (e.touches.length === 0) state.isDragging = false;
+    });
+
+    // ----------------------------------------------------------- controls
+    document.getElementById('color-scheme-select').addEventListener('change', e => {
+        state.colorScheme = parseInt(e.target.value); drawScene();
+    });
+    document.getElementById('t-slider').addEventListener('input', e => {
+        state.t = parseFloat(e.target.value);
+        document.getElementById('t-value').textContent = state.t.toFixed(4);
+        drawScene();
+    });
+    document.getElementById('aa-slider').addEventListener('input', e => {
+        state.aaRoot = parseInt(e.target.value);
+        document.getElementById('aa-value').textContent = state.aaRoot;
+        drawScene();
+    });
+    document.getElementById('max-iterations-slider').addEventListener('input', e => {
+        state.maxIterations = parseInt(e.target.value);
+        document.getElementById('max-iterations-value').textContent = state.maxIterations;
+        drawScene();
+    });
+    document.getElementById('auto-prec').addEventListener('change', e => {
+        state.autoPrec = e.target.checked;
+        document.getElementById('prec-slider').disabled = state.autoPrec;
+        drawScene();
+    });
+    document.getElementById('prec-slider').addEventListener('input', e => {
+        state.manualN = parseInt(e.target.value);
+        document.getElementById('prec-value').textContent = state.manualN;
+        if (!state.autoPrec) drawScene();
+    });
+    document.getElementById('reset-button').addEventListener('click', () => {
+        state.zoom = 0.38; state.t = 0;
+        state.frac = 32 * (requiredN(state.zoom, canvas.height) - 1);
+        state.cx = floatToRaw(-0.6, state.frac);
+        state.cy = floatToRaw(0.0, state.frac);
+        document.getElementById('t-slider').value = 0;
+        document.getElementById('t-value').textContent = '0.0000';
+        drawScene();
+    });
+
+    // ------------------------------------------------------------- export
+    document.getElementById('export-button').addEventListener('click', () => {
+        const W = parseInt(document.getElementById('export-width').value);
+        const H = parseInt(document.getElementById('export-height').value);
+        exportPNG(W, H);
+    });
+    let exporting = false;
+    const yieldFrame = () => new Promise(r => setTimeout(r, 0));
+
+    async function exportPNG(W, H) {
+        if (exporting) return;
+        const btn = document.getElementById('export-button');
+        const label = btn.textContent;
+        exporting = true; btn.disabled = true;
+
+        const N = state.N, frac = state.frac;
+        // Adaptive tile size: heavier precision -> smaller tiles, so no single
+        // GPU draw runs long enough to trip the browser's watchdog (TDR).
+        const tile = N <= 2 ? 1024 : N <= 4 ? 512 : N <= 6 ? 384 : 256;
+
+        const off = document.createElement('canvas');
+        off.width = tile; off.height = tile;
+        const eg = off.getContext('webgl2', { preserveDrawingBuffer: false, antialias: false });
+        if (!eg) { alert('export needs WebGL2'); exporting = false; btn.disabled = false; btn.textContent = label; return; }
+
+        let lost = false;
+        off.addEventListener('webglcontextlost', e => { e.preventDefault(); lost = true; });
+
+        const ectx = makeContext(eg);
+        const out = document.createElement('canvas');
+        out.width = W; out.height = H;
+        const o2 = out.getContext('2d');
+
+        // export holds the current vertical world span: pixelSize = 1/(zoom*H)
+        const exPixelRaw = stepSubRaw(state.zoom, H, frac) * BigInt(SUBSCALE);
+
+        const tilesX = Math.ceil(W / tile), tilesY = Math.ceil(H / tile);
+        const total = tilesX * tilesY;
+        const buf = new Uint8Array(tile * tile * 4);
+        const img = o2.createImageData(tile, tile);
+
+        try {
+            let done = 0;
+            for (let ty = 0; ty < tilesY; ty++) {
+                for (let tx = 0; tx < tilesX; tx++, done++) {
+                    if (lost) throw new Error('WebGL context lost (job too large for the GPU). Try a smaller size or lower AA/iterations.');
+                    const cxPix = (tx * tile + tile / 2) - W / 2;
+                    const cyPix = -((ty * tile + tile / 2) - H / 2);
+                    const tcx = state.cx + BigInt(Math.round(cxPix)) * exPixelRaw;
+                    const tcy = state.cy + BigInt(Math.round(cyPix)) * exPixelRaw;
+
+                    uploadAndDrawExport(ectx, N, frac, tcx, tcy, state.zoom, state.t, H, tile,
+                        Math.max(state.aaRoot, 2), state.maxIterations, state.colorScheme);
+                    eg.finish();                       // make sure the tile is done before readback
+                    eg.readPixels(0, 0, tile, tile, eg.RGBA, eg.UNSIGNED_BYTE, buf);
+
+                    for (let row = 0; row < tile; row++) {  // WebGL is bottom-up: flip rows
+                        const src = (tile - 1 - row) * tile * 4;
+                        img.data.set(buf.subarray(src, src + tile * 4), row * tile * 4);
+                    }
+                    o2.putImageData(img, tx * tile, ty * tile);
+
+                    btn.textContent = `Export ${Math.round(100 * (done + 1) / total)}%`;
+                    await yieldFrame();                // keep page responsive + reset GPU watchdog
+                }
+            }
+            const link = document.createElement('a');
+            link.download = `fractal_${W}x${H}.png`;
+            link.href = out.toDataURL('image/png');
+            link.click();
+        } catch (err) {
+            console.error(err);
+            alert('Export failed: ' + err.message);
+        } finally {
+            const le = eg.getExtension('WEBGL_lose_context'); if (le) le.loseContext();
+            exporting = false; btn.disabled = false; btn.textContent = label;
+        }
+    }
+    // export draws into a `tile`-sized viewport; u_resolution is the tile size,
+    // pan is the tile center, step is the export step (resolution H).
+    function uploadAndDrawExport(ctx, N, frac, cx, cy, zoom, t, H, tile, aaRoot, maxIter, cs) {
+        const glx = ctx.gl;
+        const { program, uni } = getProgram(ctx, N);
+        glx.useProgram(program);
+        const stepSub = stepSubRaw(zoom, H, frac);
+        const factorRaw = floatToRaw(2.0 + t, frac);
+        glx.uniform2f(uni.res, tile, tile);
+        glx.uniform1uiv(uni.panx, toLimbs(cx, N));
+        glx.uniform1uiv(uni.pany, toLimbs(cy, N));
+        glx.uniform1uiv(uni.step, toLimbs(stepSub, N));
+        glx.uniform1uiv(uni.factor, toLimbs(factorRaw, N));
+        glx.uniform1i(uni.aa, aaRoot);
+        glx.uniform1i(uni.maxIter, maxIter);
+        glx.uniform1i(uni.cs, cs);
+        glx.viewport(0, 0, tile, tile);
+        glx.drawArrays(glx.TRIANGLES, 0, 6);
+    }
+
+    // --------------------------------------------------------------- boot
+    initFromURL();
+    resizeCanvas();
+    drawScene();
+    </script>
+</body>
+</html>
