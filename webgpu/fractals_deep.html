@@ -628,6 +628,15 @@ void main(){
     // (gl_FragCoord is absolute), so they are automatically seamless.
     const TILE_TARGET_MS = 120;    // aim for one tile ~this long (<< ~2s watchdog)
     const FRAME_TARGET_MS = 100;   // GPU work issued per frame, then synced to pace
+    // Hard, GPU-independent bound on the work in one tile (in fixed-point
+    // "sample-iterations", N=3 baseline). Protects against the cost probe
+    // underestimating -- e.g. when it lands on a fast-escaping region while
+    // other tiles run to max iterations. Shared by interactive and export.
+    const SAFE_TILE_SAMPLE_ITERS = 2.5e8;
+    // rough per-iteration cost of each mode relative to fixed N=3
+    function modeCostFactor(mode, N) {
+        return mode === 'fixed' ? N * N / 9 : mode === 'df' ? 1 : 0.1;
+    }
     let renderGen = 0;             // bump to cancel an in-flight progressive render
     let pendingIdle = 0;
 
@@ -652,7 +661,10 @@ void main(){
         const perSample = Math.max(1e-7, probeMs / (PB * PB * aaSamples));
 
         let T = Math.floor(Math.sqrt(TILE_TARGET_MS / (aaSamples * perSample)));
-        T = Math.max(64, Math.min(1024, T));
+        // content-aware hard cap, independent of the probe (same shield as export)
+        const capT = Math.floor(Math.sqrt(SAFE_TILE_SAMPLE_ITERS /
+            (aaSamples * state.maxIterations * modeCostFactor(state.mode, state.N))));
+        T = Math.max(32, Math.min(1024, Math.min(T, capT)));
         const tilesX = Math.ceil(W / T), tilesY = Math.ceil(H / T), total = tilesX * tilesY;
         let idx = 0;
         let perFrame = Math.max(1, Math.round(FRAME_TARGET_MS / Math.max(1, T * T * aaSamples * perSample)));
@@ -996,10 +1008,7 @@ void main(){
 
         const EXPORT_AA = 6;            // always render export at high quality
         const TILE_BUDGET_MS = 200;    // GPU-time target per tile (probe-based)
-        // Hard cap on work per tile, independent of any probe: bounds
-        // sample-iterations so a single tile can't overrun the ~2s watchdog even
-        // if the probe underestimates (e.g. it landed on a fast-escaping point).
-        const SAFE_TILE_SAMPLE_ITERS = 2.5e8;
+        // (per-tile work is hard-capped by the shared SAFE_TILE_SAMPLE_ITERS)
 
         // Export ALWAYS uses fixed-point: it is exact, so tiled output is
         // provably seamless (float/double-float tiles round each tile's local
@@ -1041,7 +1050,7 @@ void main(){
         // GPU-independent content bound so no tile can overrun the watchdog.
         const aaSamp = 1 + EXPORT_AA * EXPORT_AA;
         const capPx = Math.max(32, Math.floor(Math.sqrt(
-            SAFE_TILE_SAMPLE_ITERS / (aaSamp * state.maxIterations * (N * N / 9)))));
+            SAFE_TILE_SAMPLE_ITERS / (aaSamp * state.maxIterations * modeCostFactor(mode, N)))));
         const MAXLEAF = Math.min(512, capPx);   // offscreen is 1024; also <= content cap
         const MINLEAF = 32, SAFE_MS = 700;      // shrink if a tile exceeds SAFE_MS
         let leaf = Math.min(MAXLEAF, 96);       // start conservative, adapt from measurements
