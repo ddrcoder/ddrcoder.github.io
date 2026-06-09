@@ -916,16 +916,27 @@ void main(){
 
     // ----------------------------------------------------------- keyboard
     const ZOOM_STEP = 1.3;                 // zoom factor per keypress
+    const PAN_FRACTION = 0.12;             // pan per press, as a fraction of canvas height
     const zoomCenter = zf => zoomAt(canvas.width / 2, canvas.height / 2, zf);
+    function panBy(dirX, dirY) {           // camera-direction (+x right, +y up), in device px
+        const amt = canvas.height * PAN_FRACTION;
+        state.cx += BigInt(Math.round(dirX * amt)) * state.pixelRaw;
+        state.cy += BigInt(Math.round(dirY * amt)) * state.pixelRaw;
+        drawScene();
+    }
     const keyActions = {
         '.': () => zoomCenter(ZOOM_STEP),       // zoom in
         ',': () => zoomCenter(1 / ZOOM_STEP),   // zoom out
+        'arrowright': () => panBy(1, 0),  'd': () => panBy(1, 0),
+        'arrowleft':  () => panBy(-1, 0), 'a': () => panBy(-1, 0),
+        'arrowup':    () => panBy(0, 1),  'w': () => panBy(0, 1),
+        'arrowdown':  () => panBy(0, -1), 's': () => panBy(0, -1),
     };
     window.addEventListener('keydown', e => {
         const t = e.target;
         if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;  // don't hijack form fields
         if (e.metaKey || e.ctrlKey || e.altKey) return;
-        const action = keyActions[e.key];
+        const action = keyActions[e.key.toLowerCase()];
         if (action) { e.preventDefault(); action(); }
     });
 
