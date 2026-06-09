@@ -827,17 +827,23 @@ void main(){
             // accept both new ('zoom','iter') and earlier ('z','i') param names
             state.zoom = parseFloat(p.get('zoom') || p.get('z')) || state.zoom;
             state.aaRoot = parseInt(p.get('aa')); if (isNaN(state.aaRoot)) state.aaRoot = 2;
+            // legacy fractals.html URLs allowed aa up to 8; the shader's AA loop
+            // caps at 64 samples (root 6 = 37), beyond which output darkens
+            state.aaRoot = Math.max(0, Math.min(6, state.aaRoot));
             // pick precision from the sub-pixel step (coords are precision-independent)
             const legacyF = parseInt(p.get('f'));               // very old URLs stored raw limbs @ frac
             const xs = p.get('x'), ys = p.get('y');
             const isRaw = !isNaN(legacyF) && !xs.includes('.');
             state.frac = isRaw ? legacyF : 32 * (requiredN(state.zoom, window.innerHeight, state.aaRoot) - 1);
-            state.N = state.frac / 32 + 1;
+            // guard non-multiple-of-32 legacy frac; syncPrecision re-normalizes
+            state.N = Math.max(2, Math.round(state.frac / 32) + 1);
             state.cx = isRaw ? BigInt(xs) : decToRaw(xs, state.frac);
             state.cy = isRaw ? BigInt(ys) : decToRaw(ys, state.frac);
             state.t = parseFloat(p.get('t')) || 0;
             const iterv = parseInt(p.get('iter') || p.get('i'));
-            state.maxIterations = iterv || state.maxIterations;
+            // the shader iteration loop is bounded at 2048; clamp so the readout
+            // and URL never claim more than what actually renders
+            if (iterv) state.maxIterations = Math.max(8, Math.min(2048, iterv));
             state.colorScheme = parseInt(p.get('cs')) || 0;
         } else {
             // default framing of the set
