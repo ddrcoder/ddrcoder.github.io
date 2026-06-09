@@ -1022,6 +1022,12 @@ void main(){
 
     async function exportPNG(W, H) {
         if (exporting) return;
+        // NaN/zero/negative dims would feed NaN rects into the quadtree;
+        // 16384 is a safe per-side bound under every browser's canvas limits
+        if (!Number.isInteger(W) || !Number.isInteger(H) || W < 1 || H < 1 || W > 16384 || H > 16384) {
+            alert('Export size must be between 1 and 16384 pixels per side.');
+            return;
+        }
         const btn = document.getElementById('export-button');
         const label = btn.textContent;
         exporting = true; btn.disabled = true;
