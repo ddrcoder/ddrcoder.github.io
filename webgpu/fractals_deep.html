@@ -1027,8 +1027,11 @@ void main(){
         out.width = W; out.height = H;
         const o2 = out.getContext('2d');
 
-        // export holds the current vertical world span: pixelSize = 1/(zoom*H)
-        const exPixelRaw = stepSubRaw(state.zoom, H, frac) * BigInt(SUBSCALE);
+        // export holds the current vertical world span: pixelSize = 1/(zoom*H).
+        // Keep the per-SUB-UNIT step: odd-sized tiles have centers on half-pixel
+        // coordinates, so the pan must be rounded in sub-units (exact) rather
+        // than whole pixels (a 0.5px shift -> visible seams between tiles).
+        const exStepSub = stepSubRaw(state.zoom, H, frac);
 
         // Adaptive quadtree: a DFS stack of rects is split until each leaf is
         // <= the current leaf size, then rendered+measured. The leaf size GROWS
@@ -1062,8 +1065,8 @@ void main(){
                 // render leaf r (its own pan; fixed-point makes tiles seamless)
                 const t0 = performance.now();
                 const cxPix = (r.x + r.w / 2) - W / 2, cyPix = -((r.y + r.h / 2) - H / 2);
-                const tcx = cx + BigInt(Math.round(cxPix)) * exPixelRaw;
-                const tcy = cy + BigInt(Math.round(cyPix)) * exPixelRaw;
+                const tcx = cx + BigInt(Math.round(cxPix * SUBSCALE)) * exStepSub;
+                const tcy = cy + BigInt(Math.round(cyPix * SUBSCALE)) * exStepSub;
                 uploadGeneric(ectx, mode, N, frac, tcx, tcy, state.zoom, state.t,
                     r.w, r.h, H, EXPORT_AA, state.maxIterations, state.colorScheme);
                 eg.readPixels(0, 0, r.w, r.h, eg.RGBA, eg.UNSIGNED_BYTE, buf);
