@@ -181,7 +181,10 @@
         let [ip, fp = ''] = str.split('.');
         const scale = 1n << BigInt(frac);
         let raw = (ip === '' ? 0n : BigInt(ip)) * scale;
-        if (fp.length) raw += (BigInt(fp) * scale) / (10n ** BigInt(fp.length));
+        if (fp.length) {
+            const den = 10n ** BigInt(fp.length);
+            raw += (BigInt(fp) * scale + den / 2n) / den;   // round, don't truncate
+        }
         return neg ? -raw : raw;
     }
 
