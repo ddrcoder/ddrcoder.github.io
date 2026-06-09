@@ -136,7 +136,14 @@
         if (el) el.textContent = 'GPU context lost — a frame was too heavy.\n' +
             'Lower Iter / precision, then reload.';
     });
-    canvas.addEventListener('webglcontextrestored', () => { contextLost = false; });
+    canvas.addEventListener('webglcontextrestored', () => {
+        // every GL object died with the old context -- rebuild before drawing
+        contextLost = false;
+        mainCtx.cache.clear();                       // stale programs
+        setupQuad(gl);                               // stale vertex buffer
+        fbo = null; fboTex = null; fboW = 0; fboH = 0;  // ensureFBO recreates lazily
+        drawScene();
+    });
 
     // ---------------------------------------------------------------- state
     const state = {
@@ -529,7 +536,7 @@ void main(){
             }
         };
     }
-    function makeContext(glx) {
+    function setupQuad(glx) {
         // fullscreen quad on attribute location 0 (shared across programs)
         const buf = glx.createBuffer();
         glx.bindBuffer(glx.ARRAY_BUFFER, buf);
@@ -538,8 +545,8 @@ void main(){
         ]), glx.STATIC_DRAW);
         glx.enableVertexAttribArray(0);
         glx.vertexAttribPointer(0, 2, glx.FLOAT, false, 0, 0);
-        return { gl: glx, cache: new Map() };
     }
+    function makeContext(glx) { setupQuad(glx); return { gl: glx, cache: new Map() }; }
     function getProgram(ctx, mode, N) {
         const key = mode === 'fixed' ? 'fix' + N : mode;
         if (!ctx.cache.has(key)) ctx.cache.set(key, buildProgram(ctx.gl, mode, N));
