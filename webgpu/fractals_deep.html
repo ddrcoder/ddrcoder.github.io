@@ -900,18 +900,17 @@ void main(){
     }, { passive: false });
 
     // touch: drag + pinch
-    let lastDist = 0, lastMidX = 0, lastMidY = 0;
+    let lastDist = 0;
     canvas.addEventListener('touchstart', e => {
         if (e.touches.length === 1) {
             state.isDragging = true;
             state.lastX = e.touches[0].clientX; state.lastY = e.touches[0].clientY;
+            state.accX = 0; state.accY = 0;
         } else if (e.touches.length === 2) {
             state.isDragging = false;
             const dx = e.touches[0].clientX - e.touches[1].clientX;
             const dy = e.touches[0].clientY - e.touches[1].clientY;
             lastDist = Math.hypot(dx, dy);
-            lastMidX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-            lastMidY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
         }
     }, { passive: false });
     canvas.addEventListener('touchmove', e => {
@@ -927,7 +926,7 @@ void main(){
             const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
             const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
             if (lastDist > 0) zoomAt(midX * state.dpr, midY * state.dpr, dist / lastDist);
-            lastDist = dist; lastMidX = midX; lastMidY = midY;
+            lastDist = dist;
         }
     }, { passive: false });
     canvas.addEventListener('touchend', e => {
