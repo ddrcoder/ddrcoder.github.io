@@ -676,7 +676,7 @@ void main(){
         const tilesX = Math.ceil(W / T), tilesY = Math.ceil(H / T), total = tilesX * tilesY;
         let idx = 0;
         let perFrame = Math.max(1, Math.round(FRAME_TARGET_MS / Math.max(1, T * T * aaSamples * perSample)));
-        const startWall = performance.now();
+        let gpuMs = probeMs;        // sum of measured render time (excludes rAF gaps)
 
         function frame() {
             if (gen !== renderGen || contextLost) return;
@@ -690,11 +690,12 @@ void main(){
             }
             gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, syncPixel);  // pace + bound the queue
             const frameMs = performance.now() - fStart;
+            gpuMs += frameMs;
             perFrame = Math.max(1, Math.round(perFrame * FRAME_TARGET_MS / Math.max(1, frameMs)));
             if (idx < total) {
                 requestAnimationFrame(frame);
             } else {
-                state.lastRenderMs = performance.now() - startWall + probeMs;
+                state.lastRenderMs = gpuMs;   // render time, not wall-clock with rAF idle
                 state.lastRenderAA = aaRoot;
                 updateReadout();
                 if (onDone) onDone();
