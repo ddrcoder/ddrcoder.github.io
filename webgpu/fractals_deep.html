@@ -914,6 +914,21 @@ void main(){
         if (e.touches.length === 0) state.isDragging = false;
     });
 
+    // ----------------------------------------------------------- keyboard
+    const ZOOM_STEP = 1.3;                 // zoom factor per keypress
+    const zoomCenter = zf => zoomAt(canvas.width / 2, canvas.height / 2, zf);
+    const keyActions = {
+        '.': () => zoomCenter(ZOOM_STEP),       // zoom in
+        ',': () => zoomCenter(1 / ZOOM_STEP),   // zoom out
+    };
+    window.addEventListener('keydown', e => {
+        const t = e.target;
+        if (t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName)) return;  // don't hijack form fields
+        if (e.metaKey || e.ctrlKey || e.altKey) return;
+        const action = keyActions[e.key];
+        if (action) { e.preventDefault(); action(); }
+    });
+
     // ----------------------------------------------------------- controls
     document.getElementById('color-scheme-select').addEventListener('change', e => {
         state.colorScheme = parseInt(e.target.value); drawScene();
