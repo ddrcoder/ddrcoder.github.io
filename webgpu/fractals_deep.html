@@ -370,7 +370,7 @@ uniform int  u_aa_root;
 uniform int  u_max_iter;
 uniform int  u_color_scheme;
 out vec4 fragColor;
-
+${SHADE}
 bool isNeg(uint a[N]){ return (a[N-1] & 0x80000000u) != 0u; }
 
 // 32x32 -> 64 widening multiply, synthesized from 16-bit halves
@@ -487,22 +487,7 @@ void main(){
             for (int k=0;k<N;k++){ zx[k]=nx[k]; zy[k]=ny[k]; }
         }
 
-        if (mu < float(u_max_iter)){
-            mu -= log2(log2(fdot)) + 4.0;           // smooth iteration count
-        }
-        float tcol = mu / float(u_max_iter);
-
-        vec3 tap;
-        if (u_color_scheme == 1){
-            tap = vec3(clamp(tcol*3.0,       0.0,1.0),
-                       clamp(tcol*3.0 - 1.0, 0.0,1.0),
-                       clamp(tcol*3.0 - 2.0, 0.0,1.0));
-        } else {
-            tap = vec3(clamp(tcol*3.0 - 2.0, 0.0,1.0),
-                       clamp(tcol*3.0 - 1.0, 0.0,1.0),
-                       clamp(tcol*3.0,       0.0,1.0));
-        }
-        color += tap;
+        color += shade(mu, fdot, u_max_iter, u_color_scheme);
     }
     color /= float(aa_max);
     fragColor = vec4(color, 1.0);
