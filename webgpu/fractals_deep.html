@@ -92,7 +92,6 @@
     // =====================================================================
 
     const SUBSCALE = 256;          // sub-pixel grid for AA offsets (8 bits)
-    const TILE_SIZE = 1024;        // export tile size
     const IDLE_INTERVAL = 250;     // ms before high-quality idle redraw
     const MAX_LIMBS = 16;          // FRAC up to 480 bits  (~zoom 1e144)
 
@@ -736,7 +735,6 @@ void main(){
         gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER, null);
         gl.blitFramebuffer(0, 0, lowW, lowH, 0, 0, W, H, gl.COLOR_BUFFER_BIT, gl.LINEAR);
         gl.bindFramebuffer(gl.READ_FRAMEBUFFER, null);
-        state.perSampleMs = per;
         state.lastRenderMs = performance.now() - t0; state.lastRenderAA = 0;
         updateReadout();
     }
